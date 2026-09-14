@@ -1,0 +1,273 @@
+//! Scene packs written by tools/pack.py (manifest.json, version 1), and their playback state.
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::BufReader;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+
+use crate::{Result, Rng};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize,
+    pub y1: usize,
+}
+
+impl Rect {
+    pub fn width(&self) -> usize {
+        self.x1 - self.x0
+    }
+
+    pub fn height(&self) -> usize {
+        self.y1 - self.y0
+    }
+
+    pub fn area(&self) -> usize {
+        self.width() * self.height()
+    }
+
+    pub fn intersect(&self, other: &Rect) -> Option<Rect> {
+        let r = Rect {
+            x0: self.x0.max(other.x0),
+            y0: self.y0.max(other.y0),
+            x1: self.x1.min(other.x1),
+            y1: self.y1.min(other.y1),
+        };
+        (r.x0 < r.x1 && r.y0 < r.y1).then_some(r)
+    }
+
+    pub fn union(&self, other: &Rect) -> Rect {
+        Rect {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+}
+
+pub struct Scene {
+    pub width: usize,
+    pub height: usize,
+    pub background: u8,
+    pub lut: [[u8; 4]; 256],
+    pub layers: Vec<Layer>,
+}
+
+pub struct Layer {
+    /// The layer's current image, canvas-sized; index 0 is transparent.
+    pub pixels: Vec<u8>,
+    pub animation: Option<Animation>,
+}
+
+pub struct Animation {
+    steps: Vec<Step>,
+    loop_to: Option<usize>,
+    wrap: Option<Patch>,
+    current: usize,
+    /// When the next step is entered; None once a non-looping animation has ended.
+    pub due: Option<Instant>,
+}
+
+struct Step {
+    holds: Vec<f64>,
+    patch: Option<Patch>,
+}
+
+struct Patch {
+    rect: Rect,
+    pixels: Vec<u8>,
+    /// Tile-aligned rectangles covering the pixels that actually change; the patch image spans their bounding box.
+    dirty: Vec<Rect>,
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    version: u32,
+    size: [usize; 2],
+    background: u8,
+    palettes: HashMap<String, String>,
+    layers: Vec<LayerSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LayerSpec {
+    Choices {
+        name: String,
+        choices: Vec<String>,
+        sources: Vec<String>,
+    },
+    Timeline {
+        name: String,
+        base: String,
+        steps: Vec<StepSpec>,
+        #[serde(rename = "loop")]
+        loop_to: Option<usize>,
+        wrap: Option<PatchSpec>,
+    },
+}
+
+#[derive(Deserialize)]
+struct StepSpec {
+    hold: Vec<f64>,
+    patch: Option<PatchSpec>,
+}
+
+#[derive(Deserialize)]
+struct PatchSpec {
+    rect: [usize; 4],
+    image: String,
+    dirty: Vec<[usize; 4]>,
+}
+
+/// Load a pack with one palette. `pick(layer name, game source paths)` chooses the image of each choice layer.
+pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> Result<usize>) -> Result<Scene> {
+    let path = dir.join("manifest.json");
+    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e} (run tools/pack.py)", path.display()))?;
+    let manifest: Manifest = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if manifest.version != 1 {
+        return Err(format!("{}: version {}, expected 1 (rebuild with tools/pack.py)", path.display(), manifest.version).into());
+    }
+    let [width, height] = manifest.size;
+
+    let lut_file = manifest.palettes.get(palette).ok_or_else(|| {
+        let mut names: Vec<&str> = manifest.palettes.keys().map(String::as_str).collect();
+        names.sort();
+        format!("no palette {palette:?} in {} (available: {})", dir.display(), names.join(", "))
+    })?;
+    let bytes = fs::read(dir.join(lut_file))?;
+    let mut lut = [[0u8; 4]; 256];
+    if bytes.len() != lut.len() * 4 {
+        return Err(format!("{lut_file}: {} bytes, expected 1024", bytes.len()).into());
+    }
+    for (entry, chunk) in lut.iter_mut().zip(bytes.chunks_exact(4)) {
+        entry.copy_from_slice(chunk);
+    }
+
+    let rect = |r: [usize; 4], within: Rect, what: &str| -> Result<Rect> {
+        let [x0, y0, x1, y1] = r;
+        if x0 >= x1 || y0 >= y1 || x0 < within.x0 || y0 < within.y0 || x1 > within.x1 || y1 > within.y1 {
+            return Err(format!("{what}: rect {r:?} outside {within:?}").into());
+        }
+        Ok(Rect { x0, y0, x1, y1 })
+    };
+    let canvas = Rect { x0: 0, y0: 0, x1: width, y1: height };
+
+    let mut layers = Vec::new();
+    for spec in manifest.layers {
+        layers.push(match spec {
+            LayerSpec::Choices { name, choices, sources } => {
+                if choices.is_empty() || sources.len() != choices.len() {
+                    return Err(format!("layer {name}: choices and sources don't match").into());
+                }
+                let image = &choices[pick(&name, &sources)?];
+                Layer { pixels: read_indexed(&dir.join(image), width, height)?, animation: None }
+            }
+            LayerSpec::Timeline { name, base, steps, loop_to, wrap } => {
+                if steps.len() < 2 || loop_to.is_some_and(|l| l >= steps.len()) {
+                    return Err(format!("layer {name}: bad timeline").into());
+                }
+                let patch = |p: Option<PatchSpec>| -> Result<Option<Patch>> {
+                    let Some(p) = p else { return Ok(None) };
+                    let bounds = rect(p.rect, canvas, &p.image)?;
+                    // Tile-aligned, so they may reach past the patch's exact bounds, never past the canvas.
+                    let dirty = p.dirty.iter().map(|&d| rect(d, canvas, &p.image)).collect::<Result<Vec<_>>>()?;
+                    let pixels = read_indexed(&dir.join(&p.image), bounds.width(), bounds.height())?;
+                    Ok(Some(Patch { rect: bounds, pixels, dirty }))
+                };
+                let steps = steps
+                    .into_iter()
+                    .map(|s| Ok(Step { holds: s.hold, patch: patch(s.patch)? }))
+                    .collect::<Result<Vec<_>>>()?;
+                if steps.iter().any(|s| s.holds.is_empty()) {
+                    return Err(format!("layer {name}: step without holds").into());
+                }
+                let animation = Animation { steps, loop_to, wrap: patch(wrap)?, current: 0, due: None };
+                Layer { pixels: read_indexed(&dir.join(base), width, height)?, animation: Some(animation) }
+            }
+        });
+    }
+    Ok(Scene { width, height, background: manifest.background, lut, layers })
+}
+
+impl Scene {
+    /// Resolve the topmost opaque index of every pixel in `rect` into `frame`: the bottom layer over the background,
+    /// then each layer above over that. Branch-free selects per pixel, so the loops vectorise.
+    pub fn composite(&self, frame: &mut [u8], rect: Rect) {
+        let Some((bottom, above)) = self.layers.split_first() else {
+            return;
+        };
+        let background = self.background;
+        for y in rect.y0..rect.y1 {
+            let span = y * self.width + rect.x0..y * self.width + rect.x1;
+            let dst = &mut frame[span.clone()];
+            for (d, &s) in dst.iter_mut().zip(&bottom.pixels[span.clone()]) {
+                *d = if s != 0 { s } else { background };
+            }
+            for layer in above {
+                for (d, &s) in dst.iter_mut().zip(&layer.pixels[span.clone()]) {
+                    *d = if s != 0 { s } else { *d };
+                }
+            }
+        }
+    }
+}
+
+impl Animation {
+    pub fn start(&mut self, now: Instant, rng: &mut Rng, min_hold: Duration) {
+        self.current = 0;
+        self.due = Some(now + hold(&self.steps[0].holds, rng, min_hold));
+    }
+
+    /// Enter the next step: patch `pixels` (canvas `width` wide) and add the changed rectangles to `dirty`.
+    pub fn advance(&mut self, pixels: &mut [u8], width: usize, now: Instant, rng: &mut Rng, min_hold: Duration, dirty: &mut Vec<Rect>) {
+        let Some(due) = self.due else { return };
+        let (next, patch) = if self.current + 1 < self.steps.len() {
+            (self.current + 1, self.steps[self.current + 1].patch.as_ref())
+        } else if let Some(target) = self.loop_to {
+            (target, self.wrap.as_ref())
+        } else {
+            self.due = None;
+            return;
+        };
+        self.current = next;
+        // Keep the rhythm from the due time, but don't replay a backlog after a stall or suspend.
+        let from = if now.saturating_duration_since(due) > Duration::from_secs(1) { now } else { due };
+        self.due = Some(from + hold(&self.steps[next].holds, rng, min_hold));
+
+        let Some(patch) = patch else { return };
+        let w = patch.rect.width();
+        for (row, src) in patch.pixels.chunks_exact(w).enumerate() {
+            let start = (patch.rect.y0 + row) * width + patch.rect.x0;
+            pixels[start..start + w].copy_from_slice(src);
+        }
+        dirty.extend_from_slice(&patch.dirty);
+    }
+}
+
+fn hold(holds: &[f64], rng: &mut Rng, min_hold: Duration) -> Duration {
+    Duration::from_secs_f64(holds[rng.below(holds.len())]).max(min_hold)
+}
+
+fn read_indexed(path: &Path, width: usize, height: usize) -> Result<Vec<u8>> {
+    let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut decoder = png::Decoder::new(BufReader::new(file));
+    decoder.set_transformations(png::Transformations::IDENTITY);
+    let mut reader = decoder.read_info()?;
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("PNG too large")?];
+    let info = reader.next_frame(&mut buf)?;
+    if info.color_type != png::ColorType::Indexed
+        || info.bit_depth != png::BitDepth::Eight
+        || (info.width as usize, info.height as usize) != (width, height)
+    {
+        return Err(format!("{}: expected an 8-bit indexed {width}x{height} PNG", path.display()).into());
+    }
+    buf.truncate(width * height);
+    Ok(buf)
+}

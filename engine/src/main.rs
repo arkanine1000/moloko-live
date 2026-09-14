@@ -1,46 +1,65 @@
-//! molokolive, a first spike: composite one static scene pack (tools/pack.py) and make it the X root
-//! background the way feh does, so picom and other root-pixmap readers pick it up.
+//! molokolive: animated scene packs (tools/pack.py) behind the desktop.
+//!
+//! Each frame only the canvas rectangles a timeline step changed are recomposited, converted through the palette
+//! LUT at native size and uploaded; the X server then scales them onto the output in one grabbed burst (see
+//! output.rs). Between steps the process sleeps in poll until the next one is due.
 
-use std::ffi::OsStr;
-use std::fs;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
+mod output;
+mod pack;
+mod render;
+
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    AtomEnum, ChangeWindowAttributesAux, CloseDown, ConnectionExt as _, CreateGCAux, ImageFormat, ImageOrder,
-    PropMode,
-};
-use x11rb::wrapper::ConnectionExt as _;
+use output::{Output, Target};
+use pack::Rect;
+use render::{Fit, Geometry};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "usage: molokolive [--pack DIR] [--palette NAME] [--sky N] [--hold]
+const USAGE: &str = "usage: molokolive [options]
 
-  --pack DIR       scene pack from tools/pack.py (default rip/packs/cg_firefly)
-  --palette NAME   LUT in DIR/luts (default firefly-neutral)
-  --sky N          skybox still N instead of a random one from the pool
-  --hold           stay connected, blocked on X events, instead of exiting";
+  --scene NAME     scene pack to show (default cg_firefly)
+  --packs DIR      directory of packs from tools/pack.py (default rip/packs)
+  --palette NAME   palette LUT from the pack (default firefly-neutral)
+  --fit MODE       cover: fill the screen, cropping overflow (default); contain: letterbox
+  --output MODE    auto (default): window under a compositor, else root; window: desktop window;
+                   root: root background pixmap
+  --sky N          skybox still N (its game file number) instead of a random one from the pool
+  --max-fps F      shortest hold is 1/F s (default 20, the game's fastest animations)
+  --max-rects N    most separate draws per frame; beyond that the dirty area is covered by N strips (default 16)
+  --once           set the first frame as the root background and exit
+  --stats          print frame counts and per-stage timings every 10 s while animating";
 
 struct Args {
-    pack: PathBuf,
+    scene: String,
+    packs: PathBuf,
     palette: String,
+    fit: Fit,
+    output: Target,
     sky: Option<u32>,
-    hold: bool,
+    max_fps: f64,
+    max_rects: usize,
+    once: bool,
+    stats: bool,
 }
 
-struct Pack {
-    width: usize,
-    height: usize,
-    scale: usize,
-    layers: Vec<Layer>,
-}
+/// xorshift64: hold choices and pools only need to look random.
+pub struct Rng(u64);
 
-struct Layer {
-    name: String,
-    choices: Vec<PathBuf>,
+impl Rng {
+    fn seeded() -> Rng {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        Rng(nanos | 1)
+    }
+
+    pub fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % n as u64) as usize
+    }
 }
 
 fn main() -> ExitCode {
@@ -55,63 +74,191 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let args = parse_args()?;
-    let start = Instant::now();
-    let pack = load_pack(&args.pack)?;
-    let lut_path = args.pack.join("luts").join(format!("{}.bin", args.palette));
-    let lut = fs::read(&lut_path)
-        .map_err(|e| format!("palette {:?}: {e} (available: {})", args.palette, palettes(&args.pack)))?;
-    if lut.len() != 256 * 4 {
-        return Err(format!("{}: {} bytes, expected 1024", lut_path.display(), lut.len()).into());
-    }
+    let started = Instant::now();
+    let mut rng = Rng::seeded();
+    let dir = args.packs.join(&args.scene);
+    let mut scene = pack::load(&dir, &args.palette, &mut |name, sources| choose(name, sources, args.sky, &mut rng))?;
+    let loaded = started.elapsed();
 
-    let mut frame = vec![0u8; pack.width * pack.height];
-    for layer in &pack.layers {
-        let path = &layer.choices[choose(layer, args.sky)?];
-        let indices = read_indexed(path, pack.width, pack.height)?;
-        for (dst, &src) in frame.iter_mut().zip(&indices) {
-            if src != 0 {
-                *dst = src;
-            }
-        }
-        println!("layer {}: {}", layer.name, path.display());
-    }
-    let composited = start.elapsed();
-
-    let (width, height) = (pack.width * pack.scale, pack.height * pack.scale);
-    let bgra = render(&frame, pack.width, pack.scale, &lut);
-    let rendered = start.elapsed();
-
-    let (conn, screen_num) = x11rb::connect(None)?;
-    let pixmap = set_root_background(&conn, screen_num, &bgra, u16::try_from(width)?, u16::try_from(height)?)?;
-    let uploaded = start.elapsed();
+    let mut output = Output::connect(args.output)?;
+    let geometry = Geometry::new(scene.width, scene.height, output.width, output.height, args.fit);
+    output.prepare(scene.width, scene.height, &geometry)?;
+    let canvas = Rect { x0: 0, y0: 0, x1: scene.width, y1: scene.height };
+    let (visible, letterbox, background) = (geometry.to_output(&canvas), geometry.letterbox(), scene.lut[scene.background as usize]);
+    let mut frame = vec![scene.background; scene.width * scene.height];
+    scene.composite(&mut frame, canvas);
+    render::convert(&frame, scene.width, canvas, &scene.lut, output.image(0, canvas.area() * 4));
+    output.upload(canvas, 0)?;
+    output.publish(visible, &letterbox, background)?;
+    let animated = scene.layers.iter().filter(|l| l.animation.is_some()).count();
     println!(
-        "root pixmap 0x{pixmap:x}, {width}x{height}: load+composite {:.1} ms, render {:.1} ms, upload {:.1} ms",
-        ms(composited),
-        ms(rendered - composited),
-        ms(uploaded - rendered)
+        "{}: canvas {}x{} -> {}x{} at x{:.3} on the {}, {} layers ({animated} animated), load {:.1} ms, first frame {:.1} ms",
+        args.scene,
+        scene.width,
+        scene.height,
+        geometry.width,
+        geometry.height,
+        geometry.scale,
+        output.kind(),
+        scene.layers.len(),
+        ms(loaded),
+        ms(started.elapsed() - loaded)
     );
+    if args.once {
+        return Ok(());
+    }
 
-    if args.hold {
-        drop((frame, bgra, lut)); // so RSS while holding reflects an idle engine
-        loop {
-            if let Err(e) = conn.wait_for_event() {
-                println!("X connection closed ({e}); another background setter took over");
-                return Ok(());
+    let min_hold = Duration::from_secs_f64(1.0 / args.max_fps);
+    let now = Instant::now();
+    for animation in scene.layers.iter_mut().filter_map(|l| l.animation.as_mut()) {
+        animation.start(now, &mut rng, min_hold);
+    }
+    let (mut frames, mut rects, mut pixels, mut report) = (0u64, 0u64, 0u64, Instant::now());
+    let [mut t_composite, mut t_convert, mut t_x] = [Duration::ZERO; 3];
+    let (mut dirty, mut shown) = (Vec::new(), Vec::new());
+    loop {
+        let now = Instant::now();
+        let width = scene.width;
+        for layer in &mut scene.layers {
+            let Some(animation) = layer.animation.as_mut() else { continue };
+            while animation.due.is_some_and(|due| due <= now) {
+                animation.advance(&mut layer.pixels, width, now, &mut rng, min_hold, &mut dirty);
             }
         }
+        if !dirty.is_empty() {
+            // Upload every changed rectangle into the source first (nothing visible yet), then scale them all onto
+            // the screen at once.
+            let mut offset = 0;
+            for rect in merge(&dirty, args.max_rects) {
+                let t0 = Instant::now();
+                scene.composite(&mut frame, rect);
+                let len = rect.area() * 4;
+                if offset + len > output.capacity() {
+                    output.sync()?; // the server has read what we uploaded so far
+                    offset = 0;
+                }
+                let t1 = Instant::now();
+                render::convert(&frame, scene.width, rect, &scene.lut, output.image(offset, len));
+                let t2 = Instant::now();
+                output.upload(rect, offset)?;
+                shown.extend(geometry.to_output(&rect));
+                (t_composite, t_convert, t_x) = (t_composite + (t1 - t0), t_convert + (t2 - t1), t_x + t2.elapsed());
+                offset += len;
+                rects += 1;
+                pixels += rect.area() as u64;
+            }
+            let t3 = Instant::now();
+            output.show_frame(&shown)?;
+            output.sync()?;
+            t_x += t3.elapsed();
+            dirty.clear();
+            shown.clear();
+            frames += 1;
+            if args.stats && report.elapsed() >= Duration::from_secs(10) {
+                let secs = report.elapsed().as_secs_f64();
+                let per_frame = |d: Duration| ms(d) / frames as f64;
+                println!(
+                    "{:.1} frames/s, {:.1} rects/frame, {:.0} canvas px/s; per frame: composite {:.2} ms, convert {:.2} ms, X {:.2} ms",
+                    frames as f64 / secs,
+                    rects as f64 / frames as f64,
+                    pixels as f64 / secs,
+                    per_frame(t_composite),
+                    per_frame(t_convert),
+                    per_frame(t_x)
+                );
+                (frames, rects, pixels, report) = (0, 0, 0, Instant::now());
+                [t_composite, t_convert, t_x] = [Duration::ZERO; 3];
+            }
+        }
+        let exposed = output.drain_events()?;
+        if !exposed.is_empty() {
+            for area in exposed {
+                let bands: Vec<Rect> = letterbox.iter().filter_map(|b| b.intersect(&area)).collect();
+                output.paint(visible.and_then(|v| v.intersect(&area)), &bands, background)?;
+            }
+            output.sync()?;
+        }
+        let next = scene.layers.iter().filter_map(|l| l.animation.as_ref()?.due).min();
+        output.wait(next.map(|due| due.saturating_duration_since(Instant::now())))?;
     }
-    Ok(())
+}
+
+/// Merge rectangles whose union costs no more pixels than drawing them apart. Past `max` draws, each separate
+/// upload and scaled composite costs more than a few extra pixels: the dirty area is then covered by `max`
+/// non-overlapping horizontal strips, each spanning the dirty rectangles that cross it.
+fn merge(rects: &[Rect], max: usize) -> Vec<Rect> {
+    let mut merged: Vec<Rect> = Vec::new();
+    for r in rects {
+        match merged.iter_mut().find(|m| m.union(r).area() <= m.area() + r.area()) {
+            Some(m) => *m = m.union(r),
+            None => merged.push(*r),
+        }
+    }
+    if merged.len() <= max {
+        return merged;
+    }
+    let bounds = merged[1..].iter().fold(merged[0], |a, r| a.union(r));
+    let height = bounds.height();
+    (0..max)
+        .filter_map(|i| {
+            let strip = Rect { y0: bounds.y0 + height * i / max, y1: bounds.y0 + height * (i + 1) / max, ..bounds };
+            merged.iter().filter_map(|r| r.intersect(&strip)).reduce(|a, b| a.union(&b))
+        })
+        .collect()
+}
+
+/// A random image of the layer, or with `--sky N` the sky layer's still whose game file is N.png.
+fn choose(name: &str, sources: &[String], sky: Option<u32>, rng: &mut Rng) -> Result<usize> {
+    if let (Some(n), "sky") = (sky, name) {
+        let file = format!("{n}.png");
+        return sources
+            .iter()
+            .position(|s| s.rsplit('/').next() == Some(file.as_str()))
+            .ok_or_else(|| format!("--sky {n}: not in this scene's pool").into());
+    }
+    Ok(rng.below(sources.len()))
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = Args { pack: "rip/packs/cg_firefly".into(), palette: "firefly-neutral".into(), sky: None, hold: false };
+    let mut args = Args {
+        scene: "cg_firefly".into(),
+        packs: "rip/packs".into(),
+        palette: "firefly-neutral".into(),
+        fit: Fit::Cover,
+        output: Target::Auto,
+        sky: None,
+        max_fps: 20.0,
+        max_rects: 16,
+        once: false,
+        stats: false,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value\n{USAGE}"));
         match arg.as_str() {
-            "--pack" => args.pack = it.next().ok_or(USAGE)?.into(),
-            "--palette" => args.palette = it.next().ok_or(USAGE)?,
-            "--sky" => args.sky = Some(it.next().ok_or(USAGE)?.parse()?),
-            "--hold" => args.hold = true,
+            "--scene" => args.scene = value()?,
+            "--packs" => args.packs = value()?.into(),
+            "--palette" => args.palette = value()?,
+            "--fit" => {
+                args.fit = match value()?.as_str() {
+                    "cover" => Fit::Cover,
+                    "contain" => Fit::Contain,
+                    other => return Err(format!("--fit {other}: expected cover or contain").into()),
+                }
+            }
+            "--output" => {
+                args.output = match value()?.as_str() {
+                    "auto" => Target::Auto,
+                    "root" => Target::Root,
+                    "window" => Target::Window,
+                    other => return Err(format!("--output {other}: expected auto, root or window").into()),
+                }
+            }
+            "--sky" => args.sky = Some(value()?.parse()?),
+            "--max-fps" => args.max_fps = value()?.parse::<f64>()?.max(0.1),
+            "--max-rects" => args.max_rects = value()?.parse::<usize>()?.max(1),
+            "--once" => args.once = true,
+            "--stats" => args.stats = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -119,150 +266,16 @@ fn parse_args() -> Result<Args> {
             _ => return Err(format!("unknown argument {arg:?}\n{USAGE}").into()),
         }
     }
+    if args.once {
+        // A window disappears with the process; only the root background outlives it.
+        if args.output == Target::Window {
+            return Err("--once needs the root background (--output root or auto)".into());
+        }
+        args.output = Target::Root;
+    }
     Ok(args)
 }
 
-fn load_pack(dir: &Path) -> Result<Pack> {
-    let path = dir.join("scene.txt");
-    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e} (run tools/pack.py)", path.display()))?;
-    let (mut size, mut scale, mut layers) = (None, None, Vec::new());
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
-        let bad = || format!("{}: bad line {line:?}", path.display());
-        let mut fields = line.split_whitespace();
-        match fields.next() {
-            Some("size") => {
-                let mut dim = || fields.next().and_then(|v| v.parse::<usize>().ok()).ok_or_else(bad);
-                size = Some((dim()?, dim()?));
-            }
-            Some("scale") => scale = Some(fields.next().and_then(|v| v.parse::<usize>().ok()).ok_or_else(bad)?),
-            Some("layer") => {
-                let name = fields.next().ok_or_else(bad)?.to_string();
-                let choices: Vec<PathBuf> = fields.map(|f| dir.join(f)).collect();
-                if choices.is_empty() {
-                    return Err(bad().into());
-                }
-                layers.push(Layer { name, choices });
-            }
-            _ => return Err(bad().into()),
-        }
-    }
-    let ((width, height), scale) = size.zip(scale).ok_or_else(|| format!("{}: needs size and scale", path.display()))?;
-    Ok(Pack { width, height, scale, layers })
-}
-
-/// A random image of the layer, or with `--sky N` the sky layer's still N.
-fn choose(layer: &Layer, sky: Option<u32>) -> Result<usize> {
-    if let (Some(n), "sky") = (sky, layer.name.as_str()) {
-        let stem = n.to_string();
-        return layer
-            .choices
-            .iter()
-            .position(|p| p.file_stem() == Some(OsStr::new(&stem)))
-            .ok_or_else(|| format!("sky layer has no still {n}").into());
-    }
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos() as usize;
-    Ok(nanos % layer.choices.len())
-}
-
-fn read_indexed(path: &Path, width: usize, height: usize) -> Result<Vec<u8>> {
-    let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut decoder = png::Decoder::new(BufReader::new(file));
-    decoder.set_transformations(png::Transformations::IDENTITY);
-    let mut reader = decoder.read_info()?;
-    let mut buf = vec![0; reader.output_buffer_size().ok_or("PNG too large")?];
-    let info = reader.next_frame(&mut buf)?;
-    if info.color_type != png::ColorType::Indexed
-        || info.bit_depth != png::BitDepth::Eight
-        || (info.width as usize, info.height as usize) != (width, height)
-    {
-        return Err(format!("{}: expected an 8-bit indexed {width}x{height} PNG", path.display()).into());
-    }
-    buf.truncate(width * height);
-    Ok(buf)
-}
-
-/// Indices -> BGRX through the LUT, each native pixel expanded to scale x scale.
-fn render(frame: &[u8], width: usize, scale: usize, lut: &[u8]) -> Vec<u8> {
-    let row_bytes = width * scale * 4;
-    let mut out = vec![0u8; frame.len() * scale * scale * 4];
-    for (row, band) in frame.chunks_exact(width).zip(out.chunks_exact_mut(row_bytes * scale)) {
-        let (first, rest) = band.split_at_mut(row_bytes);
-        for (&index, block) in row.iter().zip(first.chunks_exact_mut(4 * scale)) {
-            let colour = &lut[index as usize * 4..][..4];
-            for px in block.chunks_exact_mut(4) {
-                px.copy_from_slice(colour);
-            }
-        }
-        for line in rest.chunks_exact_mut(row_bytes) {
-            line.copy_from_slice(first);
-        }
-    }
-    out
-}
-
-/// Upload into a new root-depth pixmap, make it the root background and advertise it in _XROOTPMAP_ID and
-/// ESETROOT_PMAP_ID. Like feh, free the previous setter's retained pixmap first and retain ours on exit.
-fn set_root_background(conn: &impl Connection, screen_num: usize, bgra: &[u8], width: u16, height: u16) -> Result<u32> {
-    let setup = conn.setup();
-    let screen = &setup.roots[screen_num];
-    let (root, depth) = (screen.root, screen.root_depth);
-    if (screen.width_in_pixels, screen.height_in_pixels) != (width, height) {
-        eprintln!("warning: screen is {}x{}, the scene is {width}x{height}", screen.width_in_pixels, screen.height_in_pixels);
-    }
-    let bits_per_pixel = setup.pixmap_formats.iter().find(|f| f.depth == depth).map(|f| f.bits_per_pixel);
-    let masks = screen
-        .allowed_depths
-        .iter()
-        .flat_map(|d| &d.visuals)
-        .find(|v| v.visual_id == screen.root_visual)
-        .map(|v| (v.red_mask, v.green_mask, v.blue_mask));
-    if !matches!(depth, 24 | 32)
-        || bits_per_pixel != Some(32)
-        || setup.image_byte_order != ImageOrder::LSB_FIRST
-        || masks != Some((0xff0000, 0xff00, 0xff))
-    {
-        return Err("root visual is not 24-bit BGRX with 32 bpp, the only format supported".into());
-    }
-
-    let atom = |name: &[u8]| -> Result<u32> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
-    let (xrootpmap, esetroot) = (atom(b"_XROOTPMAP_ID")?, atom(b"ESETROOT_PMAP_ID")?);
-    let old = conn.get_property(false, root, esetroot, AtomEnum::PIXMAP, 0, 1)?.reply()?;
-    if let Some(id) = old.value32().and_then(|mut v| v.next()) {
-        conn.kill_client(id)?.ignore_error();
-    }
-
-    let pixmap = conn.generate_id()?;
-    conn.create_pixmap(depth, pixmap, root, width, height)?.check()?;
-    let gc = conn.generate_id()?;
-    conn.create_gc(gc, pixmap, &CreateGCAux::new())?.check()?;
-    let row_bytes = usize::from(width) * 4;
-    let rows = ((conn.maximum_request_bytes() - 32) / row_bytes).clamp(1, usize::from(height));
-    for (i, chunk) in bgra.chunks(rows * row_bytes).enumerate() {
-        let (h, y) = (u16::try_from(chunk.len() / row_bytes)?, i16::try_from(i * rows)?);
-        conn.put_image(ImageFormat::Z_PIXMAP, pixmap, gc, width, h, 0, y, 0, depth, chunk)?.check()?;
-    }
-    conn.free_gc(gc)?;
-
-    conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().background_pixmap(pixmap))?.check()?;
-    conn.clear_area(false, root, 0, 0, 0, 0)?;
-    conn.change_property32(PropMode::REPLACE, root, xrootpmap, AtomEnum::PIXMAP, &[pixmap])?;
-    conn.change_property32(PropMode::REPLACE, root, esetroot, AtomEnum::PIXMAP, &[pixmap])?;
-    // The pixmap outlives this process, so _XROOTPMAP_ID never dangles; the next setter frees it.
-    conn.set_close_down_mode(CloseDown::RETAIN_PERMANENT)?.check()?;
-    Ok(pixmap)
-}
-
-fn palettes(pack: &Path) -> String {
-    let mut names: Vec<String> = fs::read_dir(pack.join("luts"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
-        .collect();
-    names.sort();
-    names.join(", ")
-}
-
-fn ms(d: std::time::Duration) -> f64 {
+fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }

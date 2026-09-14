@@ -4,8 +4,21 @@ A live wallpaper engine themed on Nikita Kryukov's *Milk inside a bag of milk* g
 light on CPU, GPU and battery (palette cycling on indexed art, low internal resolution, low frame rate, pausing
 when the desktop is hidden).
 
-**The wallpaper engine does not exist yet.** So far this repository holds the groundwork: tools that extract
-and study the game's assets, and a Milk-chan demo.
+**The wallpaper engine is in progress.** It plays the game's scenes with their own timings, drawing only what
+changes, but it doesn't pause yet when the desktop is hidden, on battery or when hot.
+
+## Wallpaper engine
+
+`tools/pack.py` turns the game's scene definitions and art into scene packs under `rip/packs/`: indexed layers,
+timelines with dirty rectangles, and one palette LUT per palette. `engine/` (Rust) plays a pack behind the
+desktop.
+
+```sh
+python tools/pack.py                          # every scene -> rip/packs/<scene>/
+cargo build --release --manifest-path engine/Cargo.toml
+engine/target/release/molokolive --scene mini_cg_run --palette firefly-neutral
+engine/target/release/molokolive --help       # fit, output, frame cap, stats
+```
 
 ## Milk-chan demo
 
@@ -33,6 +46,8 @@ python apps/milkchan.py --render out.png --pose arms_down --emotion smile --mood
 
 | Path | What |
 |---|---|
+| `engine/` | Wallpaper engine (Rust) |
+| `tools/pack.py` | Scene pack builder for the engine |
 | `apps/milkchan.py` | Milk-chan demo (playground) |
 | `apps/milkchan_lines.json` | Demo dialogue picks, as line ids only |
 | `apps/milkchan_reactive.json` | Reactive mode: per-artist lines and sprites, aliases, composer keywords |
