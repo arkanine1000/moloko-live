@@ -1,0 +1,14 @@
+[package]
+name = "molokolive"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+png = "0.18"
+x11rb = "0.14"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
