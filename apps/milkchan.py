@@ -9,7 +9,8 @@ ripped layers (rip/frames), so the scripts' odd layer reuses are respected.
   python apps/milkchan.py --render out.png --pose arms_down --emotion smile --mood 2 [--eyes N] [--talk N] [--scale K]
 
 Keys: P/E/M cycle pose/emotion/mood · C cycle palette (Shift reverses) · Space play/stop idle ·
-      Left/Right step frame · T talk · I pixel-perfect scaling · D dialogue · Click/Enter advance · Q/Esc quit
+      Left/Right step frame · T talk · I pixel-perfect scaling · D dialogue · Click/Enter advance ·
+      R reactive (comments on the artist mpd is playing; apps/milkchan_reactive.json) · Q/Esc quit
 
 Palettes are applied at runtime. palettes/*.json (tools/recolor_palette.py) map game colours exactly;
 palettes/*.hex use tone mapping: each colour maps to the entry nearest in OKLab lightness, hue lightly
@@ -20,21 +21,29 @@ and speaker_callback's talk logic (mouth flaps + narr.ogg loop while typing, 0.3
 Lines come from apps/milkchan_lines.json (ids only) resolved against rip/dialogue/milkchan_en.jsonl.
 """
 import argparse
+import collections
 import json
+import math
 import os
+import queue
 import random
 import re
+import signal
+import subprocess
 import sys
+import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 RIP = Path(__file__).resolve().parent.parent / "rip"
 LINES_FILE = Path(__file__).with_name("milkchan_lines.json")
+REACTIVE_FILE = Path(__file__).with_name("milkchan_reactive.json")
 POSES = {"arms_crossed": "sprites arms_crossed.rpy", "arms_down": "sprites arms_down.rpy", "one_arm": "sprites one_arm.rpy"}
 PIXEL = 2                   # the art sits on an exact 2x2 grid at 1920x1080
 CROP = (76, 44, 978, 1080)  # union bbox of all 232 sprite layers (full-res coordinates)
@@ -173,8 +182,14 @@ class Assets:
         im = self._open("gui/textbox.png") or Image.new("RGBA", (2, 2))
         return im.resize((im.width // PIXEL, im.height // PIXEL), Image.NEAREST)
 
+    @lru_cache(maxsize=1024)
+    def recoloured(self, rel, palette):
+        """A cached layer (or the textbox) with a palette applied. Recolouring each layer once costs far less
+        than recolouring every composed frame: a new blink/flap combination then only composites."""
+        return palette.apply(self.textbox() if rel == "gui/textbox.png" else self.layer(rel))
 
-def compose(assets, sprite, eye_i, talk_i):
+
+def compose(assets, sprite, eye_i, talk_i, palette=None):
     """Sprite cropped to CROP at native resolution. talk_i None = mouth closed."""
     out = Image.new("RGBA", NATIVE)
     for kind, *rest in sprite.layers:
@@ -186,32 +201,57 @@ def compose(assets, sprite, eye_i, talk_i):
             closed, anim = rest
             rel = anim[talk_i % len(anim)].path if talk_i is not None and anim else closed
         if rel:
-            out.alpha_composite(assets.layer(rel))
+            out.alpha_composite(assets.recoloured(rel, palette) if palette else assets.layer(rel))
     return out
 
 
-def compose_scene(assets, figure):
+def compose_scene(assets, figure, palette=None):
     """Full say-screen frame at native resolution: sprite at its in-game position, textbox on top."""
     scene = Image.new("RGBA", (SCREEN[0] // PIXEL, SCREEN[1] // PIXEL))
     x, y = (CROP[0] + SPRITE_OFFSET[0]) // PIXEL, (CROP[1] + SPRITE_OFFSET[1]) // PIXEL
     scene.alpha_composite(figure.crop((0, 0, min(figure.width, scene.width - x), min(figure.height, scene.height - y))), (x, y))
-    scene.alpha_composite(assets.textbox(), (TEXTBOX_POS[0] // PIXEL, TEXTBOX_POS[1] // PIXEL))
+    textbox = assets.recoloured("gui/textbox.png", palette) if palette else assets.textbox()
+    scene.alpha_composite(textbox, (TEXTBOX_POS[0] // PIXEL, TEXTBOX_POS[1] // PIXEL))
     return scene
 
 
-def fit(img, box_w, box_h, integer):
-    """integer: largest whole multiple that fits (pixel-perfect).
-    Otherwise sharp fill: nearest-neighbour up to the next whole multiple, then area-average
-    down to the exact fit, so pixels stay crisp with at most a 1px soft edge."""
-    f = min(box_w / img.width, box_h / img.height)
+def fit_geometry(width, height, box_w, box_h, integer):
+    """-> (display size, whole-multiple upscale k, mode, label).
+    "nearest": pixel-perfect, the largest whole multiple that fits (integer=True).
+    "sharp": fill; nearest-neighbour up to the next whole multiple, then area-average down to the exact
+    fit, so pixels stay crisp with at most a 1px soft edge. "smooth": Lanczos, when the box is smaller."""
+    f = min(box_w / width, box_h / height)
     if integer and f >= 1:
         k = int(f)
-        return img.resize((img.width * k, img.height * k), Image.NEAREST), f"×{k}"
-    size = (max(1, round(img.width * f)), max(1, round(img.height * f)))
+        return (width * k, height * k), k, "nearest", f"×{k}"
+    size = (max(1, round(width * f)), max(1, round(height * f)))
     if f >= 1:
-        k = -(-size[0] // img.width)
-        img = img.resize((img.width * k, img.height * k), Image.NEAREST)
-    return img.resize(size, Image.BOX), f"×{f:.2f}"
+        return size, -(-size[0] // width), "sharp", f"×{f:.2f}"
+    return size, 1, "smooth", f"×{f:.2f}"
+
+
+def scale_region(img, size, k, mode, rect=None):
+    """The part of `img` scaled to `size` inside rect (display px; None = the whole frame).
+    Nearest and sharp scaling only read each pixel's own neighbourhood, and Pillow's resize `box` keeps the
+    full-frame filter windows, so any rectangle is identical to the same pixels of a full resize. Redraws
+    use that to rescale only what changed."""
+    X0, Y0, X1, Y1 = rect or (0, 0, *size)
+    if mode == "smooth":
+        return img.resize(size, Image.LANCZOS).crop((X0, Y0, X1, Y1))
+    fx, fy = size[0] / img.width, size[1] / img.height
+    nx0, ny0 = max(0, int(X0 / fx) - 2), max(0, int(Y0 / fy) - 2)
+    nx1, ny1 = min(img.width, math.ceil(X1 / fx) + 2), min(img.height, math.ceil(Y1 / fy) + 2)
+    up = img.crop((nx0, ny0, nx1, ny1)).resize(((nx1 - nx0) * k, (ny1 - ny0) * k), Image.NEAREST)
+    if mode == "nearest":
+        return up.crop((X0 - nx0 * k, Y0 - ny0 * k, X1 - nx0 * k, Y1 - ny0 * k))
+    rx, ry = size[0] / (img.width * k), size[1] / (img.height * k)
+    return up.resize((X1 - X0, Y1 - Y0), Image.BOX,
+                     box=(X0 / rx - nx0 * k, Y0 / ry - ny0 * k, X1 / rx - nx0 * k, Y1 / ry - ny0 * k))
+
+
+def fit(img, box_w, box_h, integer):
+    size, k, mode, label = fit_geometry(img.width, img.height, box_w, box_h, integer)
+    return scale_region(img, size, k, mode), label
 
 
 @lru_cache(maxsize=16)
@@ -355,6 +395,9 @@ class TalkSound:
         self.sound = self.channel = None
         try:
             os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+            # SDL otherwise installs SIGINT/SIGTERM handlers that swallow the signal: the app would
+            # survive kill/logout once sound starts. App installs its own handlers instead.
+            os.environ.setdefault("SDL_NO_SIGNAL_HANDLERS", "1")
             import pygame
             pygame.mixer.init()
             self.sound = pygame.mixer.Sound(str(path))
@@ -372,6 +415,134 @@ class TalkSound:
             self.channel.fadeout(TALK_FADE_MS)
 
 
+# ---------------------------------------------------------------- reactive (mpd)
+
+MPC_FIELDS = ("artist", "albumartist", "composer", "title", "album", "file")
+MPC_FORMAT = "\t".join(f"%{f}%" for f in MPC_FIELDS)
+
+
+def normalise_name(name):
+    """Loose artist key: accents, case, a leading 'the', '&', punctuation and parentheticals don't matter."""
+    s = unicodedata.normalize("NFKD", name)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch)).casefold()
+    s = re.sub(r"\([^)]*\)", " ", s.replace("&", " and "))
+    s = re.sub(r"[^\w]+", " ", s).strip()
+    return re.sub(r"^the\s+", "", s)
+
+
+def split_artists(tag):
+    """'KIDS SEE GHOSTS; Pusha T' -> the whole tag first, then each credited name."""
+    if not tag:
+        return []
+    parts = re.split(r"\s*(?:;|/|,|\bfeat\.?(?=\s)|\bft\.(?=\s)|\bw/)\s*", tag)
+    return [tag, *(p for p in parts if p.strip())]
+
+
+def eye_index(sprite, state):
+    """'open' / 'half' / 'closed' -> index into the sprite's blink cycle, or None."""
+    if not (state and sprite.eyes):
+        return None
+    return next((i for i, f in enumerate(sprite.eyes) if Path(f.path).stem.endswith(f"eyes_{state}")), None)
+
+
+class ReactiveMap:
+    """Artist -> reaction. Tags resolve in order of confidence: artist tag, composer keywords (composer,
+    title, album; compilations credit performers), performer aliases, album artist, folder name, fallback."""
+
+    def __init__(self, path, sprite_index):
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        self.entries, self.fallback = data["artists"], data["fallback"]
+        self.direct, self.performers, self.keywords, self.problems = {}, {}, [], []
+        for e in [*self.entries, self.fallback]:
+            self.validate(e, sprite_index)
+        for e in self.entries:
+            for name in [e["name"], *e.get("aliases", []), *e.get("folders", [])]:
+                key = normalise_name(name)
+                if self.direct.get(key, e) is not e:
+                    self.problems.append(f"{name!r} is claimed by both {self.direct[key]['name']} and {e['name']}")
+                self.direct[key] = e
+            for name in e.get("performers", []):
+                self.performers[normalise_name(name)] = e
+            if e.get("keywords"):
+                self.keywords.append((re.compile("|".join(f"(?:{k})" for k in e["keywords"]), re.I), e))
+
+    def validate(self, e, sprite_index):
+        label = e.get("name", "fallback")
+        sprite = sprite_index.get(e["pose"], {}).get(e["emotion"], {}).get(str(e["mood"]))
+        if sprite is None:
+            self.problems.append(f"{label}: no sprite {e['pose']}/{e['emotion']}/{e['mood']}")
+        elif e.get("eyes") not in (None, "open", "half", "closed"):
+            self.problems.append(f"{label}: eyes must be open, half or closed")
+        elif e.get("eyes") and not sprite.eyes:
+            self.problems.append(f"{label}: {sprite.name} has its eyes baked in, so 'eyes' can't apply")
+
+    def resolve(self, tags):
+        """tags (MPC_FIELDS) -> (entry, which step matched)"""
+        artists = split_artists(tags.get("artist", ""))
+        for part in artists:
+            if e := self.direct.get(normalise_name(part)):
+                return e, "artist"
+        text = " ".join(tags.get(k, "") for k in ("composer", "title", "album"))
+        for rx, e in self.keywords:
+            if rx.search(text):
+                return e, "keywords"
+        album_artists = split_artists(tags.get("albumartist", ""))
+        for part in artists + album_artists:
+            if e := self.performers.get(normalise_name(part)):
+                return e, "performer"
+        for part in album_artists:
+            if e := self.direct.get(normalise_name(part)):
+                return e, "album artist"
+        folder = tags.get("file", "").split("/", 1)[0]
+        for part in (folder, re.split(r"\s+[-–]\s+|-", folder, maxsplit=1)[0]):
+            if part and (e := self.direct.get(normalise_name(part))):
+                return e, "folder"
+        return self.fallback, "fallback"
+
+
+def mpc_current():
+    out = subprocess.run(["mpc", "-f", MPC_FORMAT, "current"], capture_output=True, text=True, timeout=5)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip() or "mpc failed")
+    line = out.stdout.rstrip("\n")
+    return dict(zip(MPC_FIELDS, line.split("\t"))) if line else None
+
+
+class MpdWatcher(threading.Thread):
+    """Puts ("track", tags) on a queue whenever mpd moves to another song; ("error", text) if mpc fails."""
+
+    def __init__(self, out):
+        super().__init__(daemon=True)
+        self.out, self.proc, self.stopped, self.last = out, None, False, object()
+
+    def emit(self):
+        tags = mpc_current()
+        key = tags["file"] if tags else None
+        if key != self.last:  # idleloop also fires on pause/seek; only a new song is news
+            self.last = key
+            self.out.put(("track", tags))
+
+    def run(self):
+        try:
+            self.emit()
+            self.proc = subprocess.Popen(["mpc", "idleloop", "player"], stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, text=True)
+            for _ in self.proc.stdout:
+                if self.stopped:
+                    break
+                self.emit()
+            if not self.stopped:
+                self.out.put(("error", "mpc idleloop exited"))
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+            if not self.stopped:
+                self.out.put(("error", str(e)))
+
+    def stop(self):
+        self.stopped = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+
 # ---------------------------------------------------------------- GUI
 
 class App:
@@ -387,7 +558,7 @@ class App:
 
         self.root = root = tk.Tk()
         root.title("Milk-chan — P/E/M pose/emotion/mood · C palette (Shift: back) · Space play/stop · ←/→ step · T talk · "
-                   "I pixel-perfect · D dialogue (click/Enter advance) · Q quit")
+                   "I pixel-perfect · D dialogue (click/Enter advance) · R reactive (mpd) · Q quit")
         root.geometry("720x860")
         root.configure(bg=BG)
 
@@ -417,6 +588,8 @@ class App:
         ttk.Checkbutton(bar2, text="Pixel-perfect", variable=self.integer, command=self.redraw, takefocus=False).pack(side="left", padx=4)
         self.dialogue = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar2, text="Dialogue", variable=self.dialogue, command=self.on_dialogue, takefocus=False).pack(side="left", padx=4)
+        self.reactive = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar2, text="Reactive", variable=self.reactive, command=self.on_reactive, takefocus=False).pack(side="left", padx=4)
 
         self.canvas = tk.Canvas(root, bg=BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -424,22 +597,34 @@ class App:
         self.status.pack(fill="x")
 
         self.playing, self.eye_i, self.talk_i = True, 0, 0
-        self.timers, self.photo, self.text_photo, self.resize_job = {}, None, None, None
+        self.timers, self.resize_job = {}, None
         self.view = (0, 0, 1.0)  # scene origin on canvas + full-res -> display factor
+        # Scene and text live in persistent Tk photos and redraws upload only the rectangles that changed:
+        # at fullscreen a full rescale + upload is ~60 ms, a mouth flap ~3 ms, a typed character ~1 ms.
+        self.scene_photo = self.scene_item = self.shown = None  # shown: (native frame, geometry) on screen
+        self.text_photo = self.text_item = self.text_layer = self.text_key = None
+        self.text_drawn = 0
         # dialogue state
         self.lines, self.sound, self.line, self.order, self.pos = None, None, None, [], 0
         self.wrapped, self.total, self.chars, self.typing, self.type_start = [], 0, 0, False, 0.0
         self.font_path = rip / "raw" / "images" / "122.ttf"
+        # reactive state: eye_hold pins the blink cycle to one frame while a reaction types out
+        self.reactions, self.watcher, self.events, self.now_playing, self.eye_hold = None, None, None, None, None
+        self.reaction_key = None  # artist behind the reaction on screen; repeats don't retrigger
+        root.protocol("WM_DELETE_WINDOW", self.quit)
+        for sig in (signal.SIGTERM, signal.SIGINT):  # exit cleanly and take the mpc child with us
+            signal.signal(sig, self.on_signal)
 
         self.canvas.bind("<Configure>", self.on_resize)
         self.canvas.bind("<Button-1>", lambda e: self.advance())
         for keys, fn in ((("<space>",), self.toggle_play), (("<Left>",), lambda: self.step(-1)), (("<Right>",), lambda: self.step(1)),
-                         (("t", "T"), self.flip_talk), (("i", "I"), self.flip_integer), (("q", "Q", "<Escape>"), root.destroy),
+                         (("t", "T"), self.flip_talk), (("i", "I"), self.flip_integer), (("q", "Q", "<Escape>"), self.quit),
                          (("p",), lambda: self.cycle("pose", 1)), (("P",), lambda: self.cycle("pose", -1)),
                          (("e",), lambda: self.cycle("emotion", 1)), (("E",), lambda: self.cycle("emotion", -1)),
                          (("m",), lambda: self.cycle("mood", 1)), (("M",), lambda: self.cycle("mood", -1)),
                          (("d", "D"), self.flip_dialogue), (("<Return>", "<KP_Enter>"), self.advance),
-                         (("c",), lambda: self.cycle_palette(1)), (("C",), lambda: self.cycle_palette(-1))):
+                         (("c",), lambda: self.cycle_palette(1)), (("C",), lambda: self.cycle_palette(-1)),
+                         (("r", "R"), self.flip_reactive)):
             for k in keys:
                 root.bind(k, lambda e, fn=fn: (fn(), "break")[1])
         self.refresh_choices()
@@ -484,7 +669,8 @@ class App:
     def schedule(self, which):
         self.cancel(which)
         frames = self.sprite.eyes if which == "eyes" else self.sprite.talk
-        if not frames or (which == "eyes" and not self.playing) or (which == "talk" and not self.mouth_active()):
+        if not frames or (which == "eyes" and (not self.playing or self.eye_hold is not None)) \
+                or (which == "talk" and not self.mouth_active()):
             return
         i = self.eye_i if which == "eyes" else self.talk_i
         hold = random.choice(frames[i % len(frames)].hold or (0.1,))
@@ -511,6 +697,7 @@ class App:
         self.restart()
 
     def step(self, d):
+        self.eye_hold = None  # manual stepping overrides a held reactive eye frame
         if self.playing:
             self.toggle_play()
         if self.sprite.eyes:
@@ -554,6 +741,8 @@ class App:
         self.on_dialogue()
 
     def on_dialogue(self):
+        if self.reactive.get():  # the Dialogue toggle takes the textbox back from Reactive
+            self.stop_reactive()
         if not self.dialogue.get():
             self.cancel("type")
             self.typing, self.line = False, None
@@ -584,10 +773,16 @@ class App:
         self.pos = 0
 
     def start_line(self):
-        self.line = row = self.lines[self.order[self.pos]]
+        self.play_line(self.lines[self.order[self.pos]])
+
+    def play_line(self, row, eyes=None):
+        """Type one line: sprite from the row, optional held eye frame (reactive), talk sound and mouth."""
+        self.line, sprite = row, self.sprite
         if row.get("pose") in self.index and row.get("emotion") in self.index[row["pose"]] \
                 and row.get("mood") in self.index[row["pose"]][row["emotion"]]:
             self.pose.set(row["pose"]), self.emotion.set(row["emotion"]), self.mood.set(row["mood"])
+            sprite = self.index[row["pose"]][row["emotion"]][row["mood"]]
+        self.eye_hold = eye_index(sprite, eyes)
         text = row["text"]
         for bad, good in MISSING_GLYPHS.items():
             text = text.replace(bad, good)
@@ -608,8 +803,9 @@ class App:
             self.redraw_text()
         if chars >= self.total:
             self.finish_typing()
-        else:
-            self.timers["type"] = self.root.after(15, self.type_tick)
+        else:  # sleep until the next character is due instead of polling (fewer wakeups)
+            due = (chars + 1) / CPS - (time.monotonic() - self.type_start)
+            self.timers["type"] = self.root.after(max(1, math.ceil(due * 1000)), self.type_tick)
 
     def finish_typing(self):
         """slow_done: reveal the rest, close the mouth, fade the talk loop."""
@@ -617,6 +813,9 @@ class App:
         self.cancel("talk")
         self.typing, self.chars = False, self.total
         self.sound.stop()
+        if self.eye_hold is not None:  # reactive: the map's eye state lasts for the line, then she blinks again
+            self.eye_i, self.eye_hold = self.eye_hold, None
+            self.schedule("eyes")
         self.redraw()
 
     def advance(self):
@@ -625,10 +824,106 @@ class App:
         if self.typing:  # first click completes the line, like Ren'Py
             self.finish_typing()
             return
+        if self.reactive.get():  # reactions come from mpd; clicks don't shuffle
+            return
         self.pos += 1
         if self.pos >= len(self.order):
             self.reshuffle(avoid=self.order[-1])
         self.start_line()
+
+    # reactive ----------------------------------------------------------
+    def flip_reactive(self):
+        self.reactive.set(not self.reactive.get())
+        self.on_reactive()
+
+    def on_reactive(self):
+        if not self.reactive.get():
+            self.stop_reactive()
+            return
+        if self.reactions is None:
+            try:
+                self.reactions = ReactiveMap(REACTIVE_FILE, self.index)
+            except (OSError, ValueError, KeyError) as e:
+                self.reactive.set(False)
+                self.status.configure(text=f"Reactive unavailable: {e}")
+                return
+            for problem in self.reactions.problems:
+                print(f"warning: {problem}", file=sys.stderr)
+        self.cancel("type")  # take over the textbox if the shuffle was typing
+        self.typing, self.line, self.now_playing, self.reaction_key = False, None, None, None
+        if self.sound is None:
+            self.sound = TalkSound(self.rip / "raw" / TALK_SFX)
+        self.sound.stop()
+        self.dialogue.set(True)
+        self.events = queue.Queue()
+        self.watcher = MpdWatcher(self.events)
+        self.watcher.start()
+        self.poll_events()
+        self.restart()
+
+    def stop_reactive(self):
+        if self.watcher:
+            self.watcher.stop()
+            self.watcher = None
+        for which in ("mpd", "type", "talk"):
+            self.cancel(which)
+        self.reactive.set(False)
+        self.dialogue.set(False)
+        self.typing, self.line, self.eye_hold, self.now_playing, self.reaction_key = False, None, None, None, None
+        if self.sound:
+            self.sound.stop()
+        self.restart()
+
+    def poll_events(self):
+        self.cancel("mpd")
+        if not self.reactive.get():
+            return
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "error":
+                    self.now_playing = f"mpd error: {payload}"
+                    self.redraw()
+                elif payload:  # None = mpd stopped; keep the last reaction up
+                    self.react(payload)
+        except queue.Empty:
+            pass
+        self.timers["mpd"] = self.root.after(250, self.poll_events)
+
+    def react(self, tags):
+        entry, how = self.reactions.resolve(tags)
+        name = entry.get("name", "fallback")
+        heard = tags.get("artist") or tags.get("albumartist") or tags.get("file", "").split("/", 1)[0]
+        # Same artist as the reaction already up (next song on the album, a replay): leave it alone.
+        # Matched artists compare by entry, so credit variants count as one; unknown ones by their name.
+        key = name if entry is not self.reactions.fallback else f"fallback:{normalise_name(heard)}"
+        if key == self.reaction_key:
+            return
+        self.reaction_key = key
+        self.now_playing = f"♪ {heard} → {name} ({how})"
+        row = {"id": f"mpd:{name}", "text": entry["text"], **{k: str(entry[k]) for k in ("pose", "emotion", "mood")}}
+        self.play_line(row, eyes=entry.get("eyes"))
+
+    def on_signal(self, *_):
+        # Python runs signal handlers between bytecodes, possibly in the middle of a Tk callback (a typewriter
+        # tick, say). Quitting right there destroys the canvas under that callback, so quit once it returns.
+        try:
+            self.root.after_idle(self.quit)
+        except self.tk.TclError:  # the window is already gone
+            pass
+
+    def quit(self):
+        if self.watcher:
+            self.watcher.stop()
+            self.watcher = None
+        for which in list(self.timers):  # a queued typewriter/blink tick would fire into a destroyed canvas
+            self.cancel(which)
+        if self.resize_job:
+            self.root.after_cancel(self.resize_job)
+        try:
+            self.root.destroy()
+        except self.tk.TclError:  # already closing (window closed, then a signal)
+            pass
 
     # drawing -----------------------------------------------------------
     def on_resize(self, _event):
@@ -639,31 +934,28 @@ class App:
     def redraw(self):
         w, h = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
         s = self.sprite
-        eye_i = self.eye_i % len(s.eyes) if s.eyes else 0
+        eye_i = (self.eye_i if self.eye_hold is None else self.eye_hold) % len(s.eyes) if s.eyes else 0
         talk_i = self.talk_i % len(s.talk) if self.mouth_active() and s.talk else None
         pal, dialogue = self.current_palette(), self.dialogue.get()
         ground = pal.ground if pal else BG
         if self.canvas.cget("bg") != ground:
             self.canvas.configure(bg=ground)
             self.root.configure(bg=ground)
-        # Blinks and mouth flaps cycle through a handful of frames, so cache each finished native
-        # frame; the palette remap (20-35 ms) then runs once per distinct frame, not per tick.
+        # Blinks and mouth flaps cycle through a handful of frames, so cache each finished native frame.
+        # Palettes are applied per cached layer (Assets.recoloured), before compositing and scaling.
         key = (s.name, eye_i, talk_i, self.palette.get(), dialogue)
         if (native := self.frames.get(key)) is None:
-            native = compose(self.assets, s, eye_i, talk_i)
+            native = compose(self.assets, s, eye_i, talk_i, pal)
             if dialogue:
-                native = compose_scene(self.assets, native)
-            if pal:
-                native = pal.apply(native)  # at native resolution, before scaling blends colours
+                native = compose_scene(self.assets, native, pal)
             if len(self.frames) >= 64:
                 self.frames.pop(next(iter(self.frames)))
             self.frames[key] = native
-        img, scale = fit(native, w, h, self.integer.get())
-        origin = ((w - img.width) // 2, (h - img.height) // 2) if dialogue else ((w - img.width) // 2, h - img.height)
-        self.view = (*origin, img.width / SCREEN[0])
-        self.photo = self.ImageTk.PhotoImage(img)
-        self.canvas.delete("scene")
-        self.canvas.create_image(*origin, image=self.photo, anchor="nw", tags="scene")
+        geometry = fit_geometry(native.width, native.height, w, h, self.integer.get())
+        size, scale = geometry[0], geometry[3]
+        origin = ((w - size[0]) // 2, (h - size[1]) // 2) if dialogue else ((w - size[0]) // 2, h - size[1])
+        self.push_scene(native, geometry, origin)
+        self.view = (*origin, size[0] / SCREEN[0])
         self.redraw_text()
 
         def label(frames, i):
@@ -671,29 +963,80 @@ class App:
                 return "—"
             return f"{i % len(frames) + 1}/{len(frames)} {Path(frames[i % len(frames)].path).stem.split('_', 1)[-1]}"
         mouth = label(s.talk, self.talk_i) if talk_i is not None else "closed"
-        extra = f" · line {self.pos + 1}/{len(self.order)} {self.line['id']}" if self.dialogue.get() and self.line else ""
+        if self.reactive.get():
+            extra = f" · {self.now_playing or 'waiting for mpd'}"
+        elif self.dialogue.get() and self.line:
+            extra = f" · line {self.pos + 1}/{len(self.order)} {self.line['id']}"
+        else:
+            extra = ""
         palette = f" · {self.palette.get()}" if pal else ""
         self.status.configure(text=f"{s.name} · eyes {label(s.eyes, eye_i)} · mouth {mouth} · {scale} · "
                                    f"{'playing' if self.playing else 'stopped'}{palette}{extra}")
 
+    def push_scene(self, native, geometry, origin):
+        """Put `native` on screen at `geometry`, uploading only the rectangle that differs from what's shown."""
+        size, k, mode, _ = geometry
+        prev, self.shown = self.shown, (native, geometry)
+        if prev and prev[1] == geometry and prev[0].size == native.size and mode != "smooth":
+            # alpha_only=False: blinks and flaps change colours on opaque pixels, which an alpha bbox misses
+            bbox = None if prev[0] is native else ImageChops.difference(prev[0], native).getbbox(alpha_only=False)
+            fx, fy = size[0] / native.width, size[1] / native.height
+            rect = bbox and (max(0, math.floor(bbox[0] * fx) - 2), max(0, math.floor(bbox[1] * fy) - 2),
+                             min(size[0], math.ceil(bbox[2] * fx) + 2), min(size[1], math.ceil(bbox[3] * fy) + 2))
+            if rect is None or (rect[2] - rect[0]) * (rect[3] - rect[1]) < 0.5 * size[0] * size[1]:
+                if rect:
+                    patch = self.ImageTk.PhotoImage(scale_region(native, size, k, mode, rect))
+                    self.root.tk.call(str(self.scene_photo), "copy", str(patch), "-to", rect[0], rect[1],
+                                      "-compositingrule", "set")
+                self.canvas.coords(self.scene_item, *origin)
+                return
+        self.scene_photo = self.ImageTk.PhotoImage(scale_region(native, size, k, mode))
+        if self.scene_item is None:
+            self.scene_item = self.canvas.create_image(*origin, image=self.scene_photo, anchor="nw")
+        else:
+            self.canvas.itemconfigure(self.scene_item, image=self.scene_photo)
+            self.canvas.coords(self.scene_item, *origin)
+
     def redraw_text(self):
-        self.canvas.delete("text")
+        """Typewriter text on a persistent layer: re-render only the line being typed, upload only what's new."""
         if not (self.dialogue.get() and self.line and self.chars):
+            if self.text_item is not None:
+                self.canvas.itemconfigure(self.text_item, state="hidden")
+            self.text_key, self.text_drawn = None, 0
             return
         ox, oy, k = self.view
         full = load_font(self.font_path, TEXT_SIZE)
-        line_h = sum(full.getmetrics()) + LINE_SPACING
-        font = load_font(self.font_path, max(6, round(TEXT_SIZE * k)))
-        img = Image.new("RGBA", (round((TEXT_WIDTH + TEXT_SIZE) * k) + 1, round(len(self.wrapped) * line_h * k) + 1))
-        draw, left = ImageDraw.Draw(img), self.chars
+        line_h = (sum(full.getmetrics()) + LINE_SPACING) * k
+        font, color = load_font(self.font_path, max(6, round(TEXT_SIZE * k))), self.text_color()
+        key = (id(self.wrapped), k, color)
+        if key != self.text_key or self.chars < self.text_drawn:  # new line, resize or palette: start over
+            self.text_key, self.text_drawn = key, 0
+            self.text_layer = Image.new("RGBA", (round((TEXT_WIDTH + TEXT_SIZE) * k) + 1, round(len(self.wrapped) * line_h) + 1))
+            self.text_photo = self.ImageTk.PhotoImage(self.text_layer)
+            if self.text_item is None:
+                self.text_item = self.canvas.create_image(0, 0, image=self.text_photo, anchor="nw")
+            else:
+                self.canvas.itemconfigure(self.text_item, image=self.text_photo)
+        self.canvas.coords(self.text_item, ox + round(TEXT_POS[0] * k), oy + round(TEXT_POS[1] * k))
+        self.canvas.itemconfigure(self.text_item, state="normal")
+        self.canvas.tag_raise(self.text_item)
+        if self.chars == self.text_drawn:
+            return
+        draw, start = ImageDraw.Draw(self.text_layer), 0
         for i, text in enumerate(self.wrapped):
-            if left <= 0:
-                break
-            draw.text((0, round(i * line_h * k)), text[:left], font=font, fill=self.text_color())
-            left -= len(text)
-        self.text_photo = self.ImageTk.PhotoImage(img)
-        self.canvas.create_image(ox + round(TEXT_POS[0] * k), oy + round(TEXT_POS[1] * k), image=self.text_photo,
-                                 anchor="nw", tags="text")
+            end = start + len(text)
+            lo, hi = max(start, self.text_drawn), min(end, self.chars)
+            if lo < hi:  # this line gained characters
+                top, bottom = round(i * line_h), min(self.text_layer.height, round((i + 1) * line_h))
+                draw.rectangle((0, top, self.text_layer.width, bottom), fill=(0, 0, 0, 0))
+                shown = text[:hi - start]
+                draw.text((0, top), shown, font=font, fill=color)  # the whole prefix, so layout matches one draw
+                x0 = max(0, math.floor(font.getlength(text[:lo - start])) - 2)
+                x1 = min(self.text_layer.width, math.ceil(draw.textbbox((0, top), shown, font=font)[2]) + 2)
+                patch = self.ImageTk.PhotoImage(self.text_layer.crop((x0, top, x1, bottom)))
+                self.root.tk.call(str(self.text_photo), "copy", str(patch), "-to", x0, top, "-compositingrule", "set")
+            start = end
+        self.text_drawn = self.chars
 
     def run(self):
         self.root.mainloop()
@@ -712,10 +1055,36 @@ def main():
     ap.add_argument("--eyes", type=int, default=0, help="eye frame index")
     ap.add_argument("--talk", type=int, default=None, help="talk frame index (omit for closed mouth)")
     ap.add_argument("--scale", type=int, default=1, help="integer upscale for --render")
+    ap.add_argument("--reactive-check", action="store_true",
+                    help="validate the reactive map and resolve every song in the mpd library")
     args = ap.parse_args()
 
     sprites = load_sprites(args.rip / "raw")
     assets = Assets(args.rip / "frames")
+
+    if args.reactive_check:
+        index = {}
+        for s in sprites:
+            index.setdefault(s.pose, {}).setdefault(s.emotion, {})[s.mood] = s
+        rm = ReactiveMap(REACTIVE_FILE, index)
+        font = load_font(args.rip / "raw" / "images" / "122.ttf", TEXT_SIZE)
+        for e in [*rm.entries, rm.fallback]:
+            if len(wrap(e["text"], font, TEXT_WIDTH)) > 4:
+                rm.problems.append(f"{e.get('name', 'fallback')}: text wraps past 4 lines")
+        listing = subprocess.run(["mpc", "-f", MPC_FORMAT, "listall"], capture_output=True, text=True, check=True).stdout
+        hits, steps, fallback_folders = collections.Counter(), collections.Counter(), collections.Counter()
+        for line in listing.splitlines():
+            tags = dict(zip(MPC_FIELDS, line.split("\t")))
+            e, how = rm.resolve(tags)
+            hits[e.get("name", "fallback")] += 1
+            steps[how] += 1
+            if how == "fallback":
+                fallback_folders[tags.get("file", "").split("/", 1)[0]] += 1
+        print(f"{len(rm.entries)} artists · {sum(steps.values())} songs by match step: {dict(steps)}")
+        print("fallback songs by folder:", dict(fallback_folders))
+        print("entries matching no songs:", [e["name"] for e in rm.entries if not hits[e["name"]]])
+        print("problems:", rm.problems or "none")
+        return
 
     if args.list:
         for s in sprites:

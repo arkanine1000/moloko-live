@@ -17,6 +17,10 @@ compare against. It covers:
 - The game's say screen: textbox, Retro Gaming font, 30 cps typewriter, and the talk logic (mouth flaps and a
   looping sound while typing, 0.3 s fadeout after).
 - Runtime palettes (`palettes/`), including exact colour-map palettes built from hand recolours.
+- Reactive mode (PoC): comments on the artist mpd is playing, with one line, pose, emotion, mood and
+  optional eye state per artist, held while the line types out (`apps/milkchan_reactive.json`). A new song by the same artist doesn't
+  retrigger. `--reactive-check` validates the map
+  against the sprites and resolves every song in the library.
 - Sharp fill or pixel-perfect scaling.
 
 ```sh
@@ -31,6 +35,7 @@ python apps/milkchan.py --render out.png --pose arms_down --emotion smile --mood
 |---|---|
 | `apps/milkchan.py` | Milk-chan demo (playground) |
 | `apps/milkchan_lines.json` | Demo dialogue picks, as line ids only |
+| `apps/milkchan_reactive.json` | Reactive mode: per-artist lines and sprites, aliases, composer keywords |
 | `tools/rip.sh` | Extract the game's `archive.rpa` into `rip/` (videos skipped) |
 | `tools/dialogue.py` | Milk-chan's spoken English dialogue, tagged with the sprite shown |
 | `tools/palettes.py` | Extract, swap and neutralize PNG palettes |
