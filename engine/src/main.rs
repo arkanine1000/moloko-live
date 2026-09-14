@@ -22,7 +22,7 @@ const USAGE: &str = "usage: molokolive [options]
 
   --scene NAME     scene pack to show (default cg_firefly)
   --packs DIR      directory of packs from tools/pack.py (default rip/packs)
-  --palette NAME   palette LUT from the pack (default firefly-neutral)
+  --palette NAME   palette LUT from the pack (default neutral-lift)
   --fit MODE       cover: fill the screen, cropping overflow (default); contain: letterbox
   --output MODE    auto (default): window under a compositor, else root; window: desktop window;
                    root: root background pixmap
@@ -223,7 +223,7 @@ fn parse_args() -> Result<Args> {
     let mut args = Args {
         scene: "cg_firefly".into(),
         packs: "rip/packs".into(),
-        palette: "firefly-neutral".into(),
+        palette: "neutral-lift".into(),
         fit: Fit::Cover,
         output: Target::Auto,
         sky: None,

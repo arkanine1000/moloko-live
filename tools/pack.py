@@ -10,7 +10,8 @@ Animation(...), ATL blocks with choice/pause/repeat, LiveComposite) are parsed f
 Writes rip/packs/<scene>/ (game-derived, so under the gitignored rip/; rebuilt from scratch each run):
   manifest.json          format below
   images/<hash>.png      8-bit indexed, index 0 transparent, PLTE = game colours (viewable), deduplicated
-  luts/<palette>.bin     256 x BGRA: index -> screen colour (index 0 unused)
+  luts/<palette>.bin     256 x BGRA: index -> screen colour (index 0 unused). Palettes are tone lists (*.hex), colour
+                         maps (*.json with "map") or lift rules (*.json with "rule", from tools/recolor_scene.py)
   preview/<palette>.png  native canvas with the first image of every layer
 
 manifest.json, version 1:
@@ -238,6 +239,30 @@ class Source:
         return self.cache[rel, zoom]
 
 
+# ---------------------------------------------------------------- palettes
+
+def lift_palette(name):
+    """palettes/<name>.json if it is a lift-rule palette (tools/recolor_scene.py), else None."""
+    path = ROOT / "palettes" / f"{name}.json"
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text())
+    return data if "rule" in data else None
+
+
+def lift_colours(colours, palette):
+    """(n, 3) uint8 game colours -> (n, 3) uint8 under the palette's lift rule, the same for every scene."""
+    rule = palette["rule"]
+    lab = mc.srgb_to_oklab(np.asarray(colours, float).reshape(-1, 3))
+    L, C = np.clip(lab[:, 0], 0, 1), np.hypot(lab[:, 1], lab[:, 2])
+    l0 = rule["l0"]
+    Lp = l0 + (1 - l0) * L ** rule["gamma"]
+    c0, c1, c2 = rule["chroma"]
+    Cp = np.clip(c0 + c1 * C + c2 * Lp * (1 - Lp), 0, None)
+    h = np.radians(rule["hue"][0] + rule["hue"][1] * Lp)
+    return mc.oklab_to_srgb(np.column_stack([Lp, Cp * np.cos(h), Cp * np.sin(h)]))
+
+
 # ---------------------------------------------------------------- pack
 
 def build(scene, palettes, images):
@@ -345,10 +370,13 @@ def build(scene, palettes, images):
     available = mc.load_palettes()
     lut_paths = {}
     for name in palettes:
-        if name not in available:
+        if rule := lift_palette(name):
+            mapped = lift_colours(colours, rule)
+        elif name in available:
+            pal = available[name]
+            mapped = colours if pal is None else pal.map(colours)
+        else:
             sys.exit(f"unknown palette {name!r}; known: {', '.join(available)}")
-        pal = available[name]
-        mapped = colours if pal is None else pal.map(colours)
         file = name.replace(" ", "-")
         lut = np.zeros((256, 4), np.uint8)
         lut[1:len(mapped) + 1] = np.column_stack([mapped[:, 2], mapped[:, 1], mapped[:, 0], np.full(len(mapped), 255)])
@@ -371,7 +399,7 @@ def build(scene, palettes, images):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("scenes", nargs="*", choices=[[]] + sorted(SCENES), help="default: all")
-    ap.add_argument("--palette", nargs="+", default=["firefly-neutral", "milkchan-neutral", "none"])
+    ap.add_argument("--palette", nargs="+", default=["firefly-neutral", "neutral-lift", "milkchan-neutral", "none"])
     args = ap.parse_args()
     images = parse_images(RIP / "raw" / "art.rpy")
     for scene in args.scenes or sorted(SCENES):

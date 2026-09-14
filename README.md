@@ -16,7 +16,7 @@ desktop.
 ```sh
 python tools/pack.py                          # every scene -> rip/packs/<scene>/
 cargo build --release --manifest-path engine/Cargo.toml
-engine/target/release/molokolive --scene mini_cg_run --palette firefly-neutral
+engine/target/release/molokolive --scene mini_cg_run   # default palette neutral-lift
 engine/target/release/molokolive --help       # fit, output, frame cap, stats
 ```
 
@@ -55,6 +55,7 @@ python apps/milkchan.py --render out.png --pose arms_down --emotion smile --mood
 | `tools/dialogue.py` | Milk-chan's spoken English dialogue, tagged with the sprite shown |
 | `tools/palettes.py` | Extract, swap and neutralize PNG palettes |
 | `tools/recolor_palette.py` | Build a colour-map palette from a hand-recoloured sprite |
+| `tools/recolor_scene.py` | Fit a lift-rule palette (`neutral-lift`) to hand-recoloured scene frames |
 | `palettes/` | Palettes: `*.hex` lists, `*.json` colour maps, swatches |
 | `rip/` | Extracted game assets, dialogue and recolours (**gitignored**, never commit) |
 

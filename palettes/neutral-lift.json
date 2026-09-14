@@ -1,0 +1,64 @@
+{
+  "name": "neutral-lift",
+  "description": "Lift rule fitted to hand recolours of cg_dream, cg_fall_far: lightness lifted from a per-scene black level, blue-grey hue, low chroma. Built by tools/recolor_scene.py; tools/pack.py makes the LUTs.",
+  "rule": {
+    "gamma": 1.11,
+    "l0": 0.2626,
+    "chroma": [
+      0.0032,
+      0.1589,
+      0.0747
+    ],
+    "hue": [
+      261.35,
+      3.97
+    ]
+  },
+  "adjustments": {
+    "hue": "from firefly-neutral.hex, weighted by firefly-neutral.png",
+    "fitted_hue": [
+      231.87,
+      25.6
+    ],
+    "chroma_scale": 1.25
+  },
+  "scenes": {
+    "cg_dream": {
+      "fitted_l0": 0.2626,
+      "recolour": "rip/recolours/dream.png",
+      "painted": {
+        "#000000": "#1e272d",
+        "#0d0d14": "#354047",
+        "#0d0e13": "#2f383f",
+        "#0f1015": "#303940",
+        "#1b1824": "#3b464d",
+        "#1e1518": "#36414a",
+        "#301b1e": "#404c58",
+        "#52263e": "#556672",
+        "#52263f": "#556875",
+        "#539590": "#989fa8",
+        "#ac3232": "#7d8ea7",
+        "#e5d8bc": "#dee4eb"
+      }
+    },
+    "cg_fall_far": {
+      "fitted_l0": 0.195,
+      "recolour": "rip/recolours/fall_far.png",
+      "painted": {
+        "#000000": "#161b20",
+        "#0d0d14": "#232c32",
+        "#11121d": "#2a3338",
+        "#171f2c": "#333e43",
+        "#1b1824": "#2f3940",
+        "#1e1518": "#2d343d",
+        "#252837": "#3e4a51",
+        "#301b1e": "#363f4a",
+        "#52263e": "#47545f",
+        "#52263f": "#485661",
+        "#8ea595": "#9da9b4",
+        "#ac3232": "#687687",
+        "#e5d8bc": "#ced6df"
+      }
+    }
+  }
+}
