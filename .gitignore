@@ -1,0 +1,8 @@
+# Copyrighted game assets extracted from the Steam install — never commit.
+rip/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.direnv/
