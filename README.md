@@ -56,6 +56,7 @@ python apps/milkchan.py --render out.png --pose arms_down --emotion smile --mood
 | `tools/palettes.py` | Extract, swap and neutralize PNG palettes |
 | `tools/recolor_palette.py` | Build a colour-map palette from a hand-recoloured sprite |
 | `tools/recolor_scene.py` | Fit a lift-rule palette (`neutral-lift`) to hand-recoloured scene frames |
+| `tools/showreel.py` | Render scene packs into a showreel video under `rip/showreel/` |
 | `palettes/` | Palettes: `*.hex` lists, `*.json` colour maps, swatches |
 | `rip/` | Extracted game assets, dialogue and recolours (**gitignored**, never commit) |
 

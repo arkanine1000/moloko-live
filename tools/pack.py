@@ -62,9 +62,10 @@ def sky(pool):
 # A layer is an image name, {"image", "zoom", "name"}, or a list of animations: all but the last play once, then
 # the last loops.
 SCENES = {
-    "cg_ceiling": {"layers": [sky("sky3"), "cg_ceiling"]},  # fireflies_anim comes later
+    "cg_ceiling": {"layers": [sky("sky3"), "cg_ceiling", "fireflies_anim"]},  # the script adds the fireflies after a choice
     "cg_dream": {"layers": [sky("sky3"), "cg_dream_s"]},  # cg_dream_s is the variant with blinking eyes
-    "cg_eyelash": {"layers": ["cg_eyelash"]},
+    # Never shown by the script (only hidden, next to sky2). Its irises are holes, so it needs a sky behind it.
+    "cg_eyelash": {"layers": [sky("sky2"), "cg_eyelash"]},
     "cg_fall_close": {"layers": [sky("sky4"), "cg_fall_close"]},
     "cg_fall_far": {"layers": [sky("sky1"), "cg_fall_far"]},
     "cg_firefly": {"layers": [sky("sky1"), "cg_firefly"]},
