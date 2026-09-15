@@ -53,10 +53,17 @@ SKY_ZOOM = 1.01
 MINI_CROP = (224, 50, 736, 334)
 # Dirty-region grid (native px): a patch lists its changed TILE x TILE cells, merged into rectangles.
 TILE = 16
+# Share of full-resolution pixels allowed off the 2x2 grid before an image is rejected (cg_mirror_gg/57 is 3.9%).
+MAX_OFF_GRID = 0.05
 
 
 def sky(pool):
     return {"image": pool, "zoom": SKY_ZOOM, "name": "sky"}
+
+
+def reflection(pool):
+    """A cg_mirror_gg pool: `show cg_mirror_ggN at circle2: truecenter zoom 1.01`, between the sky and the mirror."""
+    return {"image": pool, "zoom": SKY_ZOOM, "name": "reflection"}
 
 
 # A layer is an image name, {"image", "zoom", "name"}, or a list of animations: all but the last play once, then
@@ -70,11 +77,12 @@ SCENES = {
     "cg_fall_far": {"layers": [sky("sky1"), "cg_fall_far"]},
     "cg_firefly": {"layers": [sky("sky1"), "cg_firefly"]},
     "cg_floor": {"layers": [sky("sky1"), "cg_floor"]},
+    "cg_mirror": {"layers": [sky("sky1"), reflection("cg_mirror_gg4"), "cg_mirror_idle"]},
+    "cg_mirror_brush": {"layers": [sky("sky1"), reflection("cg_mirror_gg1"), "cg_mirror_brush"]},
     "cg_pills": {"layers": [sky("sky2"), "cg_pills"]},
     "mini_cg_1": {"crop": MINI_CROP, "layers": [["mini_cg_1_1", "mini_cg_1_2"]]},
     "mini_cg_door": {"crop": MINI_CROP, "layers": ["mini_cg_door"]},
     "mini_cg_eyes": {"crop": MINI_CROP, "layers": ["eyes_fear"]},
-    "mini_cg_mom": {"crop": MINI_CROP, "layers": ["mini_cg_mom_1"]},
     "mini_cg_momp": {"crop": MINI_CROP, "layers": ["mini_cg_momp_22"]},
     "mini_cg_run": {"crop": MINI_CROP, "layers": ["mini_cg_run"]},
 }
@@ -110,8 +118,14 @@ def parse_images(path):
                 for x, y, expr in re.findall(r'\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s*,\s*(WhileSpeaking\([^)]*\)|"[^"]+")', body):
                     if (x, y) != ("0", "0"):
                         sys.exit(f"{m[1]}: offset LiveComposite layers are not supported")
-                    # WhileSpeaking(who, talking, silent): nobody speaks on a wallpaper, so the silent image.
-                    layers.append(STRING.findall(expr)[-1])
+                    # WhileSpeaking(who, talking, silent=Null()): nobody speaks on a wallpaper, so the silent image, which
+                    # is nothing when left out (cg_mirror_brush: its mouth and toothbrush are painted into the base).
+                    strings = STRING.findall(expr)
+                    if expr.startswith("WhileSpeaking"):
+                        if len(strings) >= 3:
+                            layers.append(strings[2])
+                    else:
+                        layers.append(strings[0])
                 images[m[1]] = ("composite", layers)
         elif m := re.match(r"(\s*)image\s+(\w+)\s*:\s*$", line):
             indent, j = len(m[1]), i + 1
@@ -221,14 +235,26 @@ class Source:
             a = np.array(Image.open(path).convert("RGBA"))
             if a.shape[:2] != (NATIVE[1] * PIXEL, NATIVE[0] * PIXEL):
                 sys.exit(f"{rel}: {a.shape[1]}x{a.shape[0]}, expected {NATIVE[0] * PIXEL}x{NATIVE[1] * PIXEL}")
-            n = a[::PIXEL, ::PIXEL].copy()
-            # A few images have stray full-resolution touches (cg_ceiling/1 2 px, cg_dream eyes_closed 920 px,
-            # mouth_closed 136 px); the grid sample keeps each block's top-left pixel. Anything more is a real problem.
-            off = int((np.repeat(np.repeat(n, PIXEL, 0), PIXEL, 1) != a).any(-1).sum())
-            if off > 0.001 * a.shape[0] * a.shape[1]:
+            # Sample every PIXEL x PIXEL block, at the grid phase that fits best: some cg_mirror_gg stills are drawn one
+            # full-resolution pixel off the grid. What still doesn't fit (a seam column, stray touches, the 1 px outlines
+            # of the gg4 reflections at up to ~4%) keeps each block's top-left pixel.
+            best = None
+            for dy in range(PIXEL):
+                for dx in range(PIXEL):
+                    shifted = np.roll(a, (-dy, -dx), (0, 1))
+                    sample = shifted[::PIXEL, ::PIXEL]
+                    off = int((np.repeat(np.repeat(sample, PIXEL, 0), PIXEL, 1) != shifted).any(-1).sum())
+                    if best is None or off < best[0]:
+                        best = (off, (dx, dy), sample.copy())
+                    if off == 0:
+                        break
+                if best[0] == 0:
+                    break
+            off, phase, n = best
+            if off > MAX_OFF_GRID * a.shape[0] * a.shape[1]:
                 sys.exit(f"{rel}: {off} px off the {PIXEL}x{PIXEL} pixel grid")
-            if off:
-                print(f"note: {rel}: {off} px off the {PIXEL}x{PIXEL} grid, sampled", file=sys.stderr)
+            if off or phase != (0, 0):
+                print(f"note: {rel}: {off} px off the {PIXEL}x{PIXEL} grid, sampled at phase {phase}", file=sys.stderr)
             self.soft += int(((n[..., 3] > 0) & (n[..., 3] < 255)).sum())
             n[..., 3] = np.where(n[..., 3] >= 128, 255, 0)
             if zoom:

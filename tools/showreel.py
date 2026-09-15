@@ -36,12 +36,12 @@ class Scene:
                 i = rng.randrange(len(layer["choices"]))
                 self.layers.append({"pixels": image(layer["choices"][i]), "anim": None})
                 if len(layer["choices"]) > 1:
-                    picks.append(Path(layer["sources"][i]).stem)
+                    picks.append(f"{layer['name']} {Path(layer['sources'][i]).stem}")
             else:
                 steps = [(s["hold"], patch(s["patch"])) for s in layer["steps"]]
                 self.layers.append({"pixels": image(layer["base"]), "anim": {
                     "steps": steps, "loop": layer["loop"], "wrap": patch(layer.get("wrap")), "current": 0, "due": None}})
-        self.label = name + (f"  (sky {', '.join(picks)})" if picks else "")
+        self.label = name + (f"  ({', '.join(picks)})" if picks else "")
         self.lut = np.fromfile(d / m["palettes"][palette], np.uint8).reshape(256, 4)[:, [2, 1, 0]]
         self.size = m["size"]
 

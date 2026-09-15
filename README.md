@@ -5,7 +5,7 @@ light on CPU, GPU and battery (palette cycling on indexed art, low internal reso
 when the desktop is hidden).
 
 **The wallpaper engine is in progress.** It plays the game's scenes with their own timings, drawing only what
-changes, but it doesn't pause yet when the desktop is hidden, on battery or when hot.
+changes, and pauses when windows cover the desktop, on battery, or above `--max-temp`. Scene rotation is next.
 
 ## Wallpaper engine
 
