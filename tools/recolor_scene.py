@@ -24,7 +24,7 @@ Adjustments after the fit, recorded in the palette:
 
 Writes palettes/<name>.json. tools/pack.py turns the rule into a LUT per scene.
 """
-import argparse, itertools, json, re, sys
+import argparse, itertools, json, os, re, sys, textwrap
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +37,21 @@ import milkchan as mc  # noqa: E402  (OKLab helpers, tone-mapped palettes for th
 RIP = ROOT / "rip"
 SKY_COLOURS = [(13, 13, 20), (82, 38, 62), (172, 50, 50)]  # every skybox still uses exactly these
 MIN_SHARE, MIN_PX = 0.9, 20  # a pair counts for the fit only if painted consistently on enough pixels
+
+
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Help at 100 columns that never breaks a word at a hyphen (palette and file names stay whole)."""
+
+    def __init__(self, prog):
+        super().__init__(prog, width=100, max_help_position=30)
+
+    def _split_lines(self, text, width):
+        return textwrap.wrap(" ".join(text.split()), width, break_on_hyphens=False)
+
+
+def default_packs():
+    """Where molokolive looks for scene packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs."""
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "molokolive" / "packs"
 
 
 def key24(rgb):
@@ -89,7 +104,7 @@ def dominant(counts):
     return {int(s): (int(counts[s].argmax()), counts[s].max() / total[s], int(total[s])) for s in np.flatnonzero(total)}
 
 
-def align(recolour, scene, stills):
+def align(recolour, scene, stills, packs):
     img = Image.open(recolour)
     if img.mode != "P":
         img = img.convert("RGB").quantize(256, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
@@ -97,7 +112,7 @@ def align(recolour, scene, stills):
         sys.exit(f"{recolour}: {img.size[0]}x{img.size[1]}, expected the game's 1920x1080 framing")
     painted = np.array(img)[::2, ::2].astype(np.int64)
     palette = np.array(img.getpalette()[:768], np.uint8).reshape(-1, 3)
-    pack = RIP / "packs" / scene
+    pack = packs / scene
     manifest = json.loads((pack / "manifest.json").read_text())
     if manifest["size"] != [960, 540]:
         sys.exit(f"{scene}: cropped scenes are not supported yet")
@@ -195,13 +210,28 @@ def palette_hue(hex_path, weights_image=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("recolours", nargs="+", help="RECOLOUR.png:SCENE")
-    ap.add_argument("--name", default="neutral-lift")
-    ap.add_argument("--baseline", default="firefly-neutral", help="tone palette to compare the rule against")
-    ap.add_argument("--hue-from", type=Path, help="tone palette (.hex) whose hue curve replaces the fitted one")
-    ap.add_argument("--hue-weights", type=Path, help="indexed image using --hue-from's palette, to weight its entries")
-    ap.add_argument("--chroma-scale", type=float, default=1.0)
+    ap = argparse.ArgumentParser(
+        prog="tools/recolor_scene.py",
+        description="Fit a palette to scene screenshots you recoloured by hand, for tools/pack.py to use.\n"
+                    "(How the fit works is described at the top of this file.)",
+        epilog="""example:
+  python tools/recolor_scene.py rip/recolours/dream.png:cg_dream rip/recolours/fall_far.png:cg_fall_far \\
+      --name neutral-lift --hue-from palettes/firefly-neutral.hex \\
+      --hue-weights ~/Pictures/wallpapers/firefly-neutral.png --chroma-scale 1.25
+  python tools/pack.py --palette neutral-lift""",
+        formatter_class=HelpFormatter,
+    )
+    ap.add_argument("recolours", nargs="+", metavar="IMAGE:SCENE",
+                    help="a recoloured 1920x1080 screenshot and the scene it shows, e.g. rip/recolours/dream.png:cg_dream")
+    ap.add_argument("--name", default="neutral-lift", help="palette to write, as palettes/NAME.json (default: %(default)s)")
+    ap.add_argument("--baseline", metavar="PALETTE", default="firefly-neutral",
+                    help="palette to compare the fit against (default: %(default)s)")
+    ap.add_argument("--hue-from", type=Path, metavar="PALETTE.hex", help="take the hue from this palette instead of the recolours")
+    ap.add_argument("--hue-weights", type=Path, metavar="IMAGE",
+                    help="an image using --hue-from's palette; its colours count by how much of the image they cover")
+    ap.add_argument("--chroma-scale", type=float, metavar="K", default=1.0, help="multiply the saturation by K (default: 1)")
+    ap.add_argument("--packs", type=Path, metavar="DIR", default=default_packs(),
+                    help="scene packs to align against (default: ~/.local/share/molokolive/packs)")
     args = ap.parse_args()
 
     stills = sky_stills()
@@ -210,7 +240,7 @@ def main():
         path, _, scene = spec.rpartition(":")
         if not path or not scene:
             sys.exit(f"{spec}: expected RECOLOUR.png:SCENE")
-        cg_map, sky_map = align(Path(path), scene, stills)
+        cg_map, sky_map = align(Path(path), scene, stills, args.packs)
         exact = {g: p for g, (p, _, _) in sky_map.items()} | {g: p for g, (p, _, _) in cg_map.items()}
         maps[scene] = {"recolour": str(Path(path)), "painted": dict(sorted(exact.items()))}
         # Fit on consistent pairs; a colour painted differently on the sky than on the CG counts once per layer.

@@ -73,8 +73,8 @@ impl Request {
 /// Send `command` to the running engine and return its reply.
 pub fn send(command: &str) -> Result<String> {
     let path = socket_path();
-    let mut stream =
-        UnixStream::connect(&path).map_err(|e| format!("no running engine at {} ({e})", path.display()))?;
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|_| format!("molokolive isn't running (nothing is listening on {})", path.display()))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.write_all(format!("{command}\n").as_bytes())?;
     let mut reply = String::new();

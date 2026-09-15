@@ -16,7 +16,7 @@ Recolours are derived from the game's art, so keep them under rip/ (gitignored).
 
 Writes palettes/<name>.json with the complete game-colour -> colour map.
 """
-import argparse, json, sys
+import argparse, json, sys, textwrap
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +30,16 @@ import milkchan as mc  # noqa: E402  (shared sprite loading + OKLab helpers)
 # paints that colour consistently: a loose match sent the dark-red hair shade to the maroon hand outline,
 # which the wallpaper splits between blue and mauve.
 REF_NEAR, REF_SHARE, GREY_C, CHROMATIC, HUE_WINDOW = 0.03, 0.4, 0.015, 0.012, 0.08
+
+
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Help at 100 columns that never breaks a word at a hyphen (palette and file names stay whole)."""
+
+    def __init__(self, prog):
+        super().__init__(prog, width=100, max_help_position=30)
+
+    def _split_lines(self, text, width):
+        return textwrap.wrap(" ".join(text.split()), width, break_on_hyphens=False)
 
 
 def lab(cols):
@@ -108,14 +118,23 @@ def match_hue(game, painted, refs, pal):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("recolour", type=Path, help="1920x1080 recoloured sprite, same framing as the game layers")
-    ap.add_argument("--sprite", default="gg_neutral_1_oa")
-    ap.add_argument("--name", default="milkchan-neutral")
-    ap.add_argument("--rip", type=Path, default=mc.RIP)
-    ap.add_argument("--hue-palette", type=Path, default=ROOT / "palettes" / "firefly-neutral.hex")
-    ap.add_argument("--hue-cg", type=Path, default=mc.RIP / "frames" / "images" / "cg_firefly" / "1.png")
-    ap.add_argument("--hue-wallpaper", type=Path, default=Path.home() / "Pictures" / "wallpapers" / "firefly-neutral.png")
+    ap = argparse.ArgumentParser(
+        prog="tools/recolor_palette.py", description=__doc__,
+        formatter_class=HelpFormatter)
+    ap.add_argument("recolour", type=Path, metavar="IMAGE",
+                    help="the recoloured sprite: 1920x1080, framed exactly like the game's sprite layers")
+    ap.add_argument("--sprite", metavar="NAME", default="gg_neutral_1_oa",
+                    help="the sprite it recolours, as listed by apps/milkchan.py --list (default: %(default)s)")
+    ap.add_argument("--name", default="milkchan-neutral", help="palette to write, as palettes/NAME.json (default: %(default)s)")
+    ap.add_argument("--rip", type=Path, metavar="DIR", default=mc.RIP, help="the extracted game files (default: rip/)")
+    ap.add_argument("--hue-palette", type=Path, metavar="PALETTE.hex", default=ROOT / "palettes" / "firefly-neutral.hex",
+                    help="palette whose hues the painted colours take (default: palettes/firefly-neutral.hex)")
+    ap.add_argument("--hue-cg", type=Path, metavar="IMAGE", default=mc.RIP / "frames" / "images" / "cg_firefly" / "1.png",
+                    help="the game image the --hue-wallpaper was made from (default: cg_firefly/1.png)")
+    ap.add_argument("--hue-wallpaper", type=Path, metavar="IMAGE",
+                    default=Path.home() / "Pictures" / "wallpapers" / "firefly-neutral.png",
+                    help="that image in --hue-palette's colours, pairing game colours with palette colours "
+                         "(default: ~/Pictures/wallpapers/firefly-neutral.png)")
     args = ap.parse_args()
 
     ref = render_reference(args.rip, args.sprite)

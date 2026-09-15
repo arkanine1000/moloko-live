@@ -4,6 +4,24 @@
 # keeping the archive's directory layout. Videos are listed in rip/skipped-videos.txt.
 set -euo pipefail
 
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    cat <<'HELP'
+usage: tools/rip.sh
+
+Extract the files of "Milk outside a bag of milk outside a bag of milk" into rip/: the whole
+archive into rip/raw, and every image, sound and script (no videos) into rip/frames.
+
+environment:
+  GAME   the game's folder
+         (default: ~/.local/share/Steam/steamapps/common/Milk outside a bag of milk outside a bag of milk)
+  OUT    where to extract to (default: rip/ in this repository)
+
+example:
+  GAME=/mnt/games/SteamLibrary/steamapps/common/"Milk outside a bag of milk outside a bag of milk" tools/rip.sh
+HELP
+    exit 0
+fi
+
 GAME="${GAME:-$HOME/.local/share/Steam/steamapps/common/Milk outside a bag of milk outside a bag of milk}"
 OUT="${OUT:-$(dirname "$0")/../rip}"
 VIDEO_RE='\.(webm|ogv|mp4|mkv|avi|mov|mpg|mpeg|m4v)$'

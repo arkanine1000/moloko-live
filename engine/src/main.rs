@@ -8,7 +8,7 @@
 //! Otherwise every timer stops, the last frame stays on screen, and the process waits for events.
 //!
 //! Scenes rotate in a shuffle: after --autoplay seconds of animation, or on `molokolive next`/`prev`, with a random
-//! skybox each time (or each scene's last one, with --persist-skybox). The same binary sends those commands.
+//! sky each time (or each scene's last one, with --persist-sky). The same binary sends those commands.
 
 mod control;
 mod i3;
@@ -31,34 +31,60 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "usage: molokolive [options]            run the engine
-       molokolive COMMAND              control the running engine
+const HELP: &str = "molokolive: scenes from \"Milk outside a bag of milk outside a bag of milk\", animated as your wallpaper
+
+Usage:
+  molokolive [OPTIONS]      start the wallpaper
+  molokolive COMMAND        control the running wallpaper
 
 Commands:
-  next, prev         the next scene in the shuffle, or back through the scenes shown
-  sky-next, sky-prev the current scene's next or previous skybox
-  pause, resume      stop or restart animation by hand
-  status             the scene, its skybox, and whether and why it is paused
+  next                      show the next scene
+  prev                      go back to the scene before
+  sky-next, sky-prev        change the current scene's sky
+  pause, resume             pause or resume the animation
+  status                    show the scene, its sky, and whether it's paused
 
-Options:
-  --packs DIR        directory of packs from tools/pack.py (default rip/packs)
-  --scenes A,B,...   scenes to rotate through (default: every pack in --packs)
-  --scene NAME       scene to start with (default: a random one)
-  --autoplay SECS    next scene after SECS seconds of animation, or off (default 60)
-  --persist-skybox   each scene keeps its last skybox instead of a random one
-  --no-drift         keep skies and reflections still (the game drifts them a pixel every 2 s)
-  --sky N            start with skybox still N (its game file number)
-  --palette NAME     palette LUT from the packs (default neutral-lift)
-  --fit MODE         cover: fill the screen, cropping overflow (default); contain: letterbox
-  --output MODE      auto (default): window under a compositor, else root; window: desktop window;
-                     root: root background pixmap
-  --max-fps F        shortest hold is 1/F s (default 20, the game's fastest animations)
-  --max-rects N      most separate draws per frame; beyond that the dirty area is covered by N strips (default 16)
-  --max-temp C       stop at or above C °C (x86_pkg_temp), resume 5 °C below (default: no limit)
-  --ignore-covered   keep animating when windows cover the desktop
-  --ignore-battery   keep animating on battery
-  --once             set the first scene's first frame as the root background and exit
-  --stats            print frame counts and per-stage timings every 10 s while animating";
+Scenes:
+  --scenes A,B,...          rotate through these scenes only (default: all)
+  --start-scene NAME        start with this scene (default: a random one)
+  --autoplay SECONDS|off    change scene after this many seconds of animation (default: 60)
+  --sky N                   start with sky N (`molokolive status` shows sky numbers)
+  --persist-sky             give each scene back the sky it had last time
+  --no-drift                keep the skies still
+
+Look:
+  --palette NAME            colour palette (default: neutral-lift)
+  --fit cover|contain       fill the screen and crop the edges, or show the whole scene
+                            with borders (default: cover)
+
+Pausing:
+  The animation pauses by itself while windows cover the desktop and while on battery.
+  --max-temp DEGREES        also pause while the CPU is at least this hot, in °C (default: no limit)
+  --ignore-covered          keep animating behind windows
+  --ignore-battery          keep animating on battery
+
+Files:
+  --packs DIR               scene packs built by tools/pack.py
+                            (default: ~/.local/share/molokolive/packs)
+
+  -h, --help                show this help
+  --help-all                also show the advanced options
+
+Examples:
+  molokolive --autoplay 120 --max-temp 80
+  molokolive --scenes cg_floor,cg_firefly --persist-sky
+  molokolive next";
+
+const HELP_ADVANCED: &str = "Advanced:
+  --output auto|window|root
+                            draw into a desktop window (needed with a compositor such as picom) or
+                            onto the root window (without one); auto decides by whether a compositor
+                            is running at startup (default: auto)
+  --max-fps FPS             speed limit for the fastest animations (default: 20, the game's own speed)
+  --max-rects N             most separate screen areas drawn per animation frame; more are merged
+                            (default: 16)
+  --once                    put the first frame on the root window and exit, without animating
+  --stats                   print drawing statistics every 10 seconds";
 
 /// How often the temperature is read while animating, or while stopped for heat.
 const TEMPERATURE_INTERVAL: Duration = Duration::from_secs(5);
@@ -73,9 +99,9 @@ const DRIFT_MAX_RECTS: usize = 256;
 struct Args {
     packs: PathBuf,
     scenes: Option<Vec<String>>,
-    scene: Option<String>,
+    start_scene: Option<String>,
     autoplay: Option<Duration>,
-    persist_skybox: bool,
+    persist_sky: bool,
     drift: bool,
     palette: String,
     fit: Fit,
@@ -223,7 +249,7 @@ struct Show {
 
 impl Show {
     /// Load a scene, picking each pool's image: `sky` for the sky layer if given, the scene's remembered image with
-    /// --persist-skybox, else a random one. Records the picks. Doesn't touch the output.
+    /// --persist-sky, else a random one. Records the picks. Doesn't touch the output.
     fn open(
         args: &Args,
         name: &str,
@@ -238,9 +264,9 @@ impl Show {
                 return sources
                     .iter()
                     .position(|s| s.rsplit('/').next() == Some(file.as_str()))
-                    .ok_or_else(|| format!("--sky {n}: not in {name}'s pool").into());
+                    .ok_or_else(|| format!("sky {n} isn't one of {name}'s skies").into());
             }
-            if args.persist_skybox
+            if args.persist_sky
                 && let Some(&index) = skies.get(&(name.to_string(), layer.to_string()))
                 && index < sources.len()
             {
@@ -327,26 +353,29 @@ impl Show {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if let [command] = argv.as_slice()
-        && control::COMMANDS.contains(&command.as_str())
-    {
+    let fail = |message: String| {
+        eprintln!("molokolive: {message}");
+        ExitCode::FAILURE
+    };
+    if let Some(command) = argv.first().filter(|a| !a.starts_with('-')) {
+        if !control::COMMANDS.contains(&command.as_str()) {
+            return fail(format!("unknown command '{command}' (commands: {})", control::COMMANDS.join(", ")));
+        }
+        if argv.len() > 1 {
+            return fail(format!("'{command}' doesn't take options"));
+        }
         return match control::send(command) {
+            Ok(reply) if reply.starts_with("error") => fail(reply.trim_start_matches("error: ").to_string()),
             Ok(reply) => {
                 println!("{reply}");
-                if reply.starts_with("error") { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+                ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("molokolive: {e}");
-                ExitCode::FAILURE
-            }
+            Err(e) => fail(e.to_string()),
         };
     }
     match parse_args(argv).and_then(run) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("molokolive: {e}");
-            ExitCode::FAILURE
-        }
+        Err(e) => fail(e.to_string()),
     }
 }
 
@@ -357,11 +386,11 @@ fn run(args: Args) -> Result<()> {
         Some(list) => list.clone(),
         None => available_scenes(&args.packs)?,
     };
-    if let Some(missing) = scenes.iter().chain(&args.scene).find(|s| !args.packs.join(s).join("manifest.json").is_file()) {
-        return Err(format!("no pack {missing:?} in {} (run tools/pack.py)", args.packs.display()).into());
+    if let Some(missing) = scenes.iter().chain(&args.start_scene).find(|s| !args.packs.join(s).join("manifest.json").is_file()) {
+        return Err(format!("no scene '{missing}' in {} (build it with tools/pack.py)", args.packs.display()).into());
     }
     let thermal = args.max_temp.map(Thermal::open).transpose()?;
-    let mut rotation = Rotation::new(scenes, args.scene.clone(), &mut rng);
+    let mut rotation = Rotation::new(scenes, args.start_scene.clone(), &mut rng);
     let mut skies = HashMap::new();
 
     let mut output = Output::connect(args.output)?;
@@ -564,7 +593,7 @@ fn run(args: Args) -> Result<()> {
                             dirty.push(show.canvas());
                             show.describe()
                         }
-                        Ok(None) => format!("{} has no skybox", show.name),
+                        Ok(None) => format!("{} has no sky", show.name),
                         Err(e) => format!("error: {e}"),
                     }
                 }
@@ -659,7 +688,8 @@ fn change_scene(
 
 /// Every directory in `packs` with a manifest, sorted.
 fn available_scenes(packs: &Path) -> Result<Vec<String>> {
-    let entries = std::fs::read_dir(packs).map_err(|e| format!("{}: {e} (run tools/pack.py)", packs.display()))?;
+    let entries = std::fs::read_dir(packs)
+        .map_err(|_| format!("no scene packs in {} (build them with tools/pack.py, or pass --packs)", packs.display()))?;
     let mut scenes: Vec<String> = entries
         .flatten()
         .filter(|e| e.path().join("manifest.json").is_file())
@@ -667,7 +697,7 @@ fn available_scenes(packs: &Path) -> Result<Vec<String>> {
         .collect();
     scenes.sort();
     if scenes.is_empty() {
-        return Err(format!("no scene packs in {} (run tools/pack.py)", packs.display()).into());
+        return Err(format!("no scene packs in {} (build them with tools/pack.py, or pass --packs)", packs.display()).into());
     }
     Ok(scenes)
 }
@@ -706,13 +736,22 @@ fn merge(rects: &[Rect], max: usize) -> Vec<Rect> {
         .collect()
 }
 
+/// Where tools/pack.py writes packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs.
+fn default_packs() -> PathBuf {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
+    data.join("molokolive").join("packs")
+}
+
 fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut args = Args {
-        packs: "rip/packs".into(),
+        packs: default_packs(),
         scenes: None,
-        scene: None,
+        start_scene: None,
         autoplay: Some(Duration::from_secs(60)),
-        persist_skybox: false,
+        persist_sky: false,
         drift: true,
         palette: "neutral-lift".into(),
         fit: Fit::Cover,
@@ -728,28 +767,28 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     };
     let mut it = argv.into_iter();
     while let Some(arg) = it.next() {
-        let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value\n{USAGE}"));
+        let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value (see molokolive --help)"));
         match arg.as_str() {
             "--packs" => args.packs = value()?.into(),
             "--scenes" => {
                 let list: Vec<String> = value()?.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
                 if list.is_empty() {
-                    return Err("--scenes needs at least one scene".into());
+                    return Err("--scenes needs at least one scene name".into());
                 }
                 args.scenes = Some(list);
             }
-            "--scene" => args.scene = Some(value()?),
+            "--start-scene" => args.start_scene = Some(value()?),
             "--autoplay" => {
                 let raw = value()?;
                 args.autoplay = match raw.as_str() {
                     "off" => None,
                     _ => match raw.parse::<f64>() {
                         Ok(secs) if secs > 0.0 => Some(Duration::from_secs_f64(secs)),
-                        _ => return Err(format!("--autoplay {raw}: expected seconds or off").into()),
+                        _ => return Err(format!("--autoplay {raw}: expected a number of seconds, or off").into()),
                     },
                 }
             }
-            "--persist-skybox" => args.persist_skybox = true,
+            "--persist-sky" => args.persist_sky = true,
             "--no-drift" => args.drift = false,
             "--palette" => args.palette = value()?,
             "--fit" => {
@@ -764,12 +803,21 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                     "auto" => Target::Auto,
                     "root" => Target::Root,
                     "window" => Target::Window,
-                    other => return Err(format!("--output {other}: expected auto, root or window").into()),
+                    other => return Err(format!("--output {other}: expected auto, window or root").into()),
                 }
             }
-            "--sky" => args.sky = Some(value()?.parse()?),
-            "--max-fps" => args.max_fps = value()?.parse::<f64>()?.max(0.1),
-            "--max-rects" => args.max_rects = value()?.parse::<usize>()?.max(1),
+            "--sky" => {
+                let raw = value()?;
+                args.sky = Some(raw.parse().map_err(|_| format!("--sky {raw}: expected a sky number, e.g. 12"))?);
+            }
+            "--max-fps" => {
+                let raw = value()?;
+                args.max_fps = raw.parse::<f64>().map_err(|_| format!("--max-fps {raw}: expected a number"))?.max(0.1);
+            }
+            "--max-rects" => {
+                let raw = value()?;
+                args.max_rects = raw.parse::<usize>().map_err(|_| format!("--max-rects {raw}: expected a whole number"))?.max(1);
+            }
             "--max-temp" => {
                 let raw = value()?;
                 args.max_temp = Some(raw.parse().map_err(|_| format!("--max-temp {raw}: expected whole degrees C, e.g. 80"))?);
@@ -779,16 +827,22 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
             "--once" => args.once = true,
             "--stats" => args.stats = true,
             "-h" | "--help" => {
-                println!("{USAGE}");
+                println!("{HELP}");
                 std::process::exit(0);
             }
-            _ => return Err(format!("unknown argument {arg:?}\n{USAGE}").into()),
+            "--help-all" => {
+                println!("{HELP}\n\n{HELP_ADVANCED}");
+                std::process::exit(0);
+            }
+            "--scene" => return Err("--scene is now --start-scene".into()),
+            "--persist-skybox" => return Err("--persist-skybox is now --persist-sky".into()),
+            _ => return Err(format!("unknown option '{arg}' (see molokolive --help)").into()),
         }
     }
     if args.once {
         // A window disappears with the process; only the root background outlives it.
         if args.output == Target::Window {
-            return Err("--once needs the root background (--output root or auto)".into());
+            return Err("--once draws onto the root window, so it can't be combined with --output window".into());
         }
         args.output = Target::Root;
     }

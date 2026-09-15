@@ -4,27 +4,42 @@
   python tools/showreel.py                                   # every pack, default palette
   python tools/showreel.py cg_floor mini_cg_run --palette firefly-neutral --out rip/showreel/test.mp4
 
-Offline, from rip/packs (tools/pack.py): the engine's timeline rules (random holds per visit, loops, wrap patches,
-a shortest hold of 1/--fps), its random sky choice (seeded here), the drift of skies and reflections (rounded to the
-nearest frame), and its cover scaling with nearest sampling, which matches the engine on screen pixel for pixel. Each scene gets its label in the game's font. The video shows game
-art, so it belongs under the gitignored rip/.
+Offline, from the scene packs (tools/pack.py): the engine's timeline rules (random holds per visit, loops, wrap
+patches, a shortest hold of 1/--fps), its random sky choice (seeded here), the drift of skies and reflections (rounded
+to the nearest frame), and its cover scaling with nearest sampling, which matches the engine on screen pixel for
+pixel. Each scene gets its label in the game's font. The video shows game art, so it belongs under the gitignored
+rip/.
 
 Every game hold is a multiple of 0.05 s, so the default 20 fps lands each step on a frame boundary. Needs ffmpeg.
 """
-import argparse, json, random, subprocess, sys
+import argparse, json, os, random, subprocess, sys, textwrap
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent.parent
-PACKS = ROOT / "rip" / "packs"
 FONT = ROOT / "rip" / "raw" / "images" / "122.ttf"  # Retro Gaming, the game's dialogue font
 
 
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Help at 100 columns that never breaks a word at a hyphen (palette and file names stay whole)."""
+
+    def __init__(self, prog):
+        super().__init__(prog, width=100, max_help_position=30)
+
+    def _split_lines(self, text, width):
+        return textwrap.wrap(" ".join(text.split()), width, break_on_hyphens=False)
+
+
+def default_packs():
+    """Where molokolive looks for scene packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs."""
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "molokolive" / "packs"
+
+
 class Scene:
-    def __init__(self, name, palette, rng, fps, drift_on=True):
-        d = PACKS / name
+    def __init__(self, name, palette, rng, fps, drift_on=True, packs=None):
+        d = (packs or default_packs()) / name
         m = json.loads((d / "manifest.json").read_text())
         if palette not in m["palettes"]:
             sys.exit(f"{name}: no palette {palette!r} (rebuild with tools/pack.py --palette {palette})")
@@ -121,23 +136,34 @@ def cover_maps(canvas, width, height):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("scenes", nargs="*", help="default: every pack in rip/packs")
-    ap.add_argument("--palette", default="neutral-lift")
-    ap.add_argument("--out", type=Path, help="default: rip/showreel/showreel-<palette>.mp4")
-    ap.add_argument("--size", default="1920x1080")
-    ap.add_argument("--fps", type=int, default=20)
-    ap.add_argument("--min-seconds", type=float, default=8, help="shortest animated scene")
-    ap.add_argument("--max-seconds", type=float, default=30,
-                    help="longest animated scene (the default fits a full cycle of every scene; mini_cg_eyes is 25.7 s)")
-    ap.add_argument("--static-seconds", type=float, default=4)
-    ap.add_argument("--seed", type=int, default=20260915, help="sky choices and holds")
-    ap.add_argument("--no-labels", action="store_true")
-    ap.add_argument("--no-drift", action="store_true", help="keep skies and reflections still, like the engine's --no-drift")
+    ap = argparse.ArgumentParser(
+        prog="tools/showreel.py",
+        description="Render the scenes into one video, played the way molokolive plays them. Needs ffmpeg.",
+        epilog="""examples:
+  python tools/showreel.py                                   every scene -> rip/showreel/showreel-neutral-lift.mp4
+  python tools/showreel.py cg_floor mini_cg_run --size 960x540 --out /tmp/two-scenes.mp4""",
+        formatter_class=HelpFormatter,
+    )
+    ap.add_argument("scenes", nargs="*", metavar="SCENE", help="scenes to include, in order (default: all)")
+    ap.add_argument("--palette", metavar="NAME", default="neutral-lift", help="colour palette (default: %(default)s)")
+    ap.add_argument("--out", type=Path, metavar="FILE", help="video to write (default: rip/showreel/showreel-PALETTE.mp4)")
+    ap.add_argument("--size", metavar="WIDTHxHEIGHT", default="1920x1080", help="video size (default: %(default)s)")
+    ap.add_argument("--fps", type=int, default=20, help="frames per second (default: %(default)s, which fits every game timing)")
+    ap.add_argument("--min-seconds", type=float, metavar="S", default=8, help="shortest time per moving scene (default: %(default)s)")
+    ap.add_argument("--max-seconds", type=float, metavar="S", default=30,
+                    help="longest time per moving scene; the default fits a full cycle of every scene (default: %(default)s)")
+    ap.add_argument("--static-seconds", type=float, metavar="S", default=4, help="time for a scene that doesn't move (default: %(default)s)")
+    ap.add_argument("--seed", type=int, default=20260915, help="seed for the random skies and timings, so renders repeat (default: %(default)s)")
+    ap.add_argument("--no-labels", action="store_true", help="leave out the scene names")
+    ap.add_argument("--no-drift", action="store_true", help="keep the skies still")
+    ap.add_argument("--packs", type=Path, metavar="DIR", default=default_packs(),
+                    help="scene packs to render (default: ~/.local/share/molokolive/packs)")
     args = ap.parse_args()
 
     width, height = map(int, args.size.split("x"))
-    scenes = args.scenes or sorted(p.name for p in PACKS.iterdir() if (p / "manifest.json").is_file())
+    if not args.packs.is_dir():
+        sys.exit(f"no scene packs in {args.packs} (build them with tools/pack.py, or pass --packs)")
+    scenes = args.scenes or sorted(p.name for p in args.packs.iterdir() if (p / "manifest.json").is_file())
     out = args.out or ROOT / "rip" / "showreel" / f"showreel-{args.palette}.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.seed)
@@ -150,7 +176,7 @@ def main():
 
     total = 0.0
     for name in scenes:
-        scene = Scene(name, args.palette, rng, args.fps, drift_on=not args.no_drift)
+        scene = Scene(name, args.palette, rng, args.fps, drift_on=not args.no_drift, packs=args.packs)
         animated = scene.moves()
         seconds = min(max(scene.cycle(), args.min_seconds), args.max_seconds) if animated else args.static_seconds
         xs, ys = cover_maps(scene.size, width, height)

@@ -7,7 +7,8 @@
 SCENES lists each scene as the layer stack rip/raw/script.rpy shows. The images themselves (plain paths,
 Animation(...), ATL blocks with choice/pause/repeat, LiveComposite) are parsed from rip/raw/art.rpy.
 
-Writes rip/packs/<scene>/ (game-derived, so under the gitignored rip/; rebuilt from scratch each run):
+Writes <packs>/<scene>/ (default packs: ~/.local/share/molokolive/packs, outside the repository; rebuilt from scratch
+each run):
   manifest.json          format below
   images/<hash>.png      8-bit indexed, index 0 transparent, PLTE = game colours (viewable), deduplicated
   luts/<palette>.bin     256 x BGRA: index -> screen colour (index 0 unused). Palettes are tone lists (*.hex), colour
@@ -34,7 +35,7 @@ manifest.json, version 1:
                            new pixels inside rect (the bounding box of what changed), and the changed pixels as
                            rectangles on a TILE grid, so the engine knows every dirty region in advance
 """
-import argparse, hashlib, json, math, re, shutil, sys
+import argparse, hashlib, json, math, os, re, shutil, sys, textwrap
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +46,12 @@ sys.path.insert(0, str(ROOT / "apps"))
 import milkchan as mc  # noqa: E402  (tone mapping and palette loading)
 
 RIP = ROOT / "rip"
+
+
+def default_packs():
+    """Where molokolive looks for scene packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs."""
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "molokolive" / "packs"
+
 NATIVE = (960, 540)
 PIXEL = 2
 BACKGROUND = (13, 13, 20)  # #0d0d14, the game's near-black and the mini_cg backdrop
@@ -91,6 +98,16 @@ SCENES = {
 }
 
 STRING = re.compile(r'"([^"]+)"')
+
+
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Help at 100 columns that never breaks a word at a hyphen (palette and file names stay whole)."""
+
+    def __init__(self, prog):
+        super().__init__(prog, width=100, max_help_position=30)
+
+    def _split_lines(self, text, width):
+        return textwrap.wrap(" ".join(text.split()), width, break_on_hyphens=False)
 NUMBER = re.compile(r"(?:pause\s+)?(\d*\.?\d+)")
 
 
@@ -347,7 +364,7 @@ def lift_colours(colours, palette):
 
 # ---------------------------------------------------------------- pack
 
-def build(scene, palettes, images):
+def build(scene, palettes, images, packs):
     spec = SCENES[scene]
     crop = spec.get("crop", (0, 0, *NATIVE))
     size = (crop[2] - crop[0], crop[3] - crop[1])
@@ -371,7 +388,7 @@ def build(scene, palettes, images):
         a = source(rel, zoom)
         return np.where(a[..., 3] == 255, np.searchsorted(keys, key24(a[..., :3])) + 1, 0).astype(np.uint8)
 
-    out = RIP / "packs" / scene
+    out = packs / scene
     shutil.rmtree(out, ignore_errors=True)
     for sub in ("images", "luts", "preview"):
         (out / sub).mkdir(parents=True)
@@ -480,13 +497,30 @@ def build(scene, palettes, images):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("scenes", nargs="*", choices=[[]] + sorted(SCENES), help="default: all")
-    ap.add_argument("--palette", nargs="+", default=["firefly-neutral", "neutral-lift", "milkchan-neutral", "none"])
+    scenes = "\n".join(textwrap.wrap(", ".join(sorted(SCENES)), 100, initial_indent="  ", subsequent_indent="  "))
+    ap = argparse.ArgumentParser(
+        prog="tools/pack.py",
+        description="Build the scene packs molokolive plays, from the game files tools/rip.sh extracted.",
+        epilog=f"""examples:
+  python tools/pack.py                          build every scene
+  python tools/pack.py cg_floor mini_cg_run     rebuild two scenes
+
+scenes:
+{scenes}""",
+        formatter_class=HelpFormatter,
+    )
+    ap.add_argument("scenes", nargs="*", metavar="SCENE", help="scenes to build (default: all)")
+    palettes = ["firefly-neutral", "neutral-lift", "milkchan-neutral", "none"]
+    ap.add_argument("--palette", nargs="+", metavar="NAME", default=palettes,
+                    help=f"palettes to include, from palettes/ (default: {' '.join(palettes)})")
+    ap.add_argument("--packs", type=Path, metavar="DIR", default=default_packs(),
+                    help="where to write the packs (default: ~/.local/share/molokolive/packs)")
     args = ap.parse_args()
+    if unknown := [s for s in args.scenes if s not in SCENES]:
+        ap.error(f"unknown scene {', '.join(unknown)} (the list is in --help)")
     images = parse_images(RIP / "raw" / "art.rpy")
     for scene in args.scenes or sorted(SCENES):
-        build(scene, args.palette, images)
+        build(scene, args.palette, images, args.packs)
 
 
 if __name__ == "__main__":
