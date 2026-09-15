@@ -71,15 +71,17 @@ The ones you're most likely to want. `molokolive --help` lists them all, and `--
 |---|---|
 | `--autoplay SECONDS` | how long each scene plays; `--autoplay off` stays on one scene (default: 60) |
 | `--scenes A,B,...` | rotate through these scenes only |
+| `--skip-scenes A,B,...` | leave these scenes out; `*` matches any text here and in `--scenes`, e.g. `--skip-scenes 'mini_cg_*'` |
 | `--start-scene NAME` | start with this scene |
 | `--persist-sky` | give each scene back the sky it had last time |
 | `--no-drift` | keep the skies still |
 | `--max-temp DEGREES` | also pause while the CPU is at least this hot, in °C |
 | `--palette NAME` | colour palette (default: `neutral-lift`) |
 
-The scenes are `cg_ceiling`, `cg_dream`, `cg_eyelash`, `cg_fall_close`, `cg_fall_far`, `cg_firefly`, `cg_floor`,
-`cg_mirror`, `cg_mirror_brush`, `cg_pills`, `mini_cg_1`, `mini_cg_door`, `mini_cg_eyes`, `mini_cg_momp` and
-`mini_cg_run`.
+`molokolive --scenes --list` shows the scenes you can use (combined with `--scenes` or `--skip-scenes`, the ones
+they pick): `cg_ceiling`, `cg_dream`, `cg_eyelash`,
+`cg_fall_close`, `cg_fall_far`, `cg_firefly`, `cg_floor`, `cg_mirror`, `cg_mirror_brush`, `cg_pills`, `mini_cg_1`,
+`mini_cg_door`, `mini_cg_eyes`, `mini_cg_momp` and `mini_cg_run`.
 
 ## i3
 

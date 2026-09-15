@@ -31,6 +31,14 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// println! that stops quietly when stdout is gone (e.g. `molokolive --scenes --list | head`) instead of panicking.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 const HELP: &str = "molokolive: scenes from \"Milk outside a bag of milk outside a bag of milk\", animated as your wallpaper
 
 Usage:
@@ -45,7 +53,9 @@ Commands:
   status                    show the scene, its sky, and whether it's paused
 
 Scenes:
-  --scenes A,B,...          rotate through these scenes only (default: all)
+  --scenes A,B,...|all      rotate through these scenes only (default: all)
+  --skip-scenes A,B,...     leave these scenes out; in both, * matches any text, e.g. 'mini_cg_*'
+  --scenes --list           list the scenes you can use, or the ones --scenes and --skip-scenes pick
   --start-scene NAME        start with this scene (default: a random one)
   --autoplay SECONDS|off    change scene after this many seconds of animation (default: 60)
   --sky N                   start with sky N (`molokolive status` shows sky numbers)
@@ -73,6 +83,7 @@ Files:
 Examples:
   molokolive --autoplay 120 --max-temp 80
   molokolive --scenes cg_floor,cg_firefly --persist-sky
+  molokolive --skip-scenes 'mini_cg_*',cg_pills
   molokolive next";
 
 const HELP_ADVANCED: &str = "Advanced:
@@ -99,6 +110,7 @@ const DRIFT_MAX_RECTS: usize = 256;
 struct Args {
     packs: PathBuf,
     scenes: Option<Vec<String>>,
+    skip_scenes: Vec<String>,
     start_scene: Option<String>,
     autoplay: Option<Duration>,
     persist_sky: bool,
@@ -367,7 +379,7 @@ fn main() -> ExitCode {
         return match control::send(command) {
             Ok(reply) if reply.starts_with("error") => fail(reply.trim_start_matches("error: ").to_string()),
             Ok(reply) => {
-                println!("{reply}");
+                say!("{reply}");
                 ExitCode::SUCCESS
             }
             Err(e) => fail(e.to_string()),
@@ -382,13 +394,7 @@ fn main() -> ExitCode {
 fn run(args: Args) -> Result<()> {
     let started = Instant::now();
     let mut rng = Rng::seeded();
-    let scenes = match &args.scenes {
-        Some(list) => list.clone(),
-        None => available_scenes(&args.packs)?,
-    };
-    if let Some(missing) = scenes.iter().chain(&args.start_scene).find(|s| !args.packs.join(s).join("manifest.json").is_file()) {
-        return Err(format!("no scene '{missing}' in {} (build it with tools/pack.py)", args.packs.display()).into());
-    }
+    let scenes = select_scenes(&args)?;
     let thermal = args.max_temp.map(Thermal::open).transpose()?;
     let mut rotation = Rotation::new(scenes, args.start_scene.clone(), &mut rng);
     let mut skies = HashMap::new();
@@ -398,7 +404,7 @@ fn run(args: Args) -> Result<()> {
     show.upload(&mut output)?;
     output.publish(show.visible, &show.letterbox, show.background)?;
     let animated = show.scene.layers.iter().filter(|l| l.animation.is_some()).count();
-    println!(
+    say!(
         "{}: canvas {}x{} -> {}x{} at x{:.3} on the {}, {} layers ({animated} animated), ready in {:.1} ms",
         show.describe(),
         show.scene.width,
@@ -448,7 +454,7 @@ fn run(args: Args) -> Result<()> {
     }
     let mut next_temperature = Instant::now() + TEMPERATURE_INTERVAL;
     let mut running = stops.running();
-    println!("{}", stops.describe());
+    say!("{}", stops.describe());
 
     let min_hold = Duration::from_secs_f64(1.0 / args.max_fps);
     show.start(&mut rng, min_hold, args.drift);
@@ -524,7 +530,7 @@ fn run(args: Args) -> Result<()> {
             if args.stats && report.elapsed() >= Duration::from_secs(10) {
                 let secs = report.elapsed().as_secs_f64();
                 let per_frame = |d: Duration| ms(d) / frames as f64;
-                println!(
+                say!(
                     "{:.1} frames/s, {:.1} rects/frame, {:.0} canvas px/s; per frame: composite {:.2} ms, convert {:.2} ms, X {:.2} ms",
                     frames as f64 / secs,
                     rects as f64 / frames as f64,
@@ -653,7 +659,7 @@ fn run(args: Args) -> Result<()> {
 
         if stops.running() != running {
             running = stops.running();
-            println!("{}", stops.describe());
+            say!("{}", stops.describe());
             if running {
                 let now = Instant::now();
                 last_tick = now;
@@ -682,7 +688,7 @@ fn change_scene(
     output.sync()?;
     next.start(rng, min_hold, args.drift);
     *show = next;
-    println!("{}", show.describe());
+    say!("{}", show.describe());
     Ok(())
 }
 
@@ -736,6 +742,102 @@ fn merge(rects: &[Rect], max: usize) -> Vec<Rect> {
         .collect()
 }
 
+/// The scenes to rotate through: --scenes (every scene by default) minus --skip-scenes, both with `*` wildcards.
+fn select_scenes(args: &Args) -> Result<Vec<String>> {
+    let available = available_scenes(&args.packs)?;
+    let matching = |patterns: &[String], option: &str| -> Result<Vec<String>> {
+        let mut found = Vec::new();
+        for pattern in patterns {
+            let matched: Vec<String> = available.iter().filter(|s| wildcard(pattern, s)).cloned().collect();
+            if matched.is_empty() {
+                return Err(format!("{option}: no scene matches '{pattern}' (molokolive --scenes --list shows them)").into());
+            }
+            found.extend(matched);
+        }
+        Ok(found)
+    };
+    let mut scenes = match &args.scenes {
+        Some(patterns) => matching(patterns, "--scenes")?,
+        None => available.clone(),
+    };
+    let skipped = matching(&args.skip_scenes, "--skip-scenes")?;
+    scenes.retain(|s| !skipped.contains(s));
+    scenes.sort();
+    scenes.dedup();
+    if scenes.is_empty() {
+        return Err("--skip-scenes leaves no scenes to show".into());
+    }
+    if let Some(start) = &args.start_scene {
+        if !available.contains(start) {
+            return Err(format!("no scene '{start}' (molokolive --scenes --list shows them)").into());
+        }
+        if !scenes.contains(start) {
+            return Err(format!("--start-scene {start} isn't in the rotation (see --scenes and --skip-scenes)").into());
+        }
+    }
+    Ok(scenes)
+}
+
+/// Whether `name` matches `pattern`, where each `*` stands for any run of characters.
+fn wildcard(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let [first, middle @ .., last] = parts.as_slice() else {
+        return pattern == name;
+    };
+    if name.len() < first.len() + last.len() || !name.starts_with(first) || !name.ends_with(last) {
+        return false;
+    }
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    for part in middle {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Print the scenes with what each has, for `--scenes --list`: every scene, or the ones --scenes and
+/// --skip-scenes pick.
+fn print_scenes(args: &Args) -> Result<()> {
+    let everything = available_scenes(&args.packs)?;
+    let filtered = args.scenes.is_some() || !args.skip_scenes.is_empty();
+    let scenes = if filtered { select_scenes(args)? } else { everything.clone() };
+    let packs = args.packs.as_path();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let shown = packs.display().to_string();
+    let shown = match shown.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        _ => shown,
+    };
+    if filtered {
+        say!("{} of the {} scenes in {shown}, as --scenes and --skip-scenes pick them:\n", scenes.len(), everything.len());
+    } else {
+        say!("Scenes in {shown}:\n");
+    }
+    let width = scenes.iter().map(String::len).max().unwrap_or(0);
+    for name in &scenes {
+        let text = std::fs::read_to_string(packs.join(name).join("manifest.json"))?;
+        let manifest: serde_json::Value = serde_json::from_str(&text)?;
+        let layers = manifest["layers"].as_array().cloned().unwrap_or_default();
+        let pool = |layer: &str| {
+            layers.iter().any(|l| l["name"] == layer && l["choices"].as_array().is_some_and(|c| c.len() > 1))
+        };
+        let mut features = Vec::new();
+        if pool("sky") {
+            features.push("sky");
+        }
+        if pool("reflection") {
+            features.push("reflection");
+        }
+        features.push(if layers.iter().any(|l| l.get("steps").is_some()) { "animated" } else { "still" });
+        say!("  {name:width$}   {}", features.join(", "));
+    }
+    say!("\nUse the names with --scenes, e.g. molokolive --scenes {},{}, or with --start-scene.",
+        everything[0], everything.get(1).unwrap_or(&everything[0]));
+    Ok(())
+}
+
 /// Where tools/pack.py writes packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs.
 fn default_packs() -> PathBuf {
     let data = std::env::var_os("XDG_DATA_HOME")
@@ -749,6 +851,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut args = Args {
         packs: default_packs(),
         scenes: None,
+        skip_scenes: Vec::new(),
         start_scene: None,
         autoplay: Some(Duration::from_secs(60)),
         persist_sky: false,
@@ -765,17 +868,45 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         once: false,
         stats: false,
     };
-    let mut it = argv.into_iter();
+    let mut list_scenes = false;
+    // `--option=value` is the same as `--option value`.
+    let argv = argv.into_iter().flat_map(|arg| match arg.split_once('=') {
+        Some((option, value)) if option.starts_with("--") => vec![option.to_string(), value.to_string()],
+        _ => vec![arg],
+    });
+    let mut it = argv.peekable();
     while let Some(arg) = it.next() {
+        if matches!(arg.as_str(), "--scenes" | "--skip-scenes" | "--start-scene") {
+            match it.peek().map(String::as_str) {
+                // Explicitly asked: list the scenes.
+                Some("--list" | "--help" | "-h") => {
+                    it.next();
+                    list_scenes = true;
+                    continue;
+                }
+                // Nothing given: keep the default (every scene, none skipped, a random start).
+                None => continue,
+                Some(next) if next.starts_with('-') => continue,
+                _ => {}
+            }
+        }
         let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value (see molokolive --help)"));
         match arg.as_str() {
             "--packs" => args.packs = value()?.into(),
             "--scenes" => {
-                let list: Vec<String> = value()?.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+                let raw = value()?;
+                if raw == "all" {
+                    args.scenes = None;
+                    continue;
+                }
+                let list: Vec<String> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
                 if list.is_empty() {
-                    return Err("--scenes needs at least one scene name".into());
+                    return Err("--scenes needs at least one scene name (molokolive --scenes --list shows them)".into());
                 }
                 args.scenes = Some(list);
+            }
+            "--skip-scenes" => {
+                args.skip_scenes = value()?.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
             }
             "--start-scene" => args.start_scene = Some(value()?),
             "--autoplay" => {
@@ -827,17 +958,21 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
             "--once" => args.once = true,
             "--stats" => args.stats = true,
             "-h" | "--help" => {
-                println!("{HELP}");
+                say!("{HELP}");
                 std::process::exit(0);
             }
             "--help-all" => {
-                println!("{HELP}\n\n{HELP_ADVANCED}");
+                say!("{HELP}\n\n{HELP_ADVANCED}");
                 std::process::exit(0);
             }
             "--scene" => return Err("--scene is now --start-scene".into()),
             "--persist-skybox" => return Err("--persist-skybox is now --persist-sky".into()),
             _ => return Err(format!("unknown option '{arg}' (see molokolive --help)").into()),
         }
+    }
+    if list_scenes {
+        print_scenes(&args)?;
+        std::process::exit(0);
     }
     if args.once {
         // A window disappears with the process; only the root background outlives it.
