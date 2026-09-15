@@ -11,9 +11,7 @@
 
 use std::os::fd::AsFd;
 use std::ptr;
-use std::time::Duration;
 
-use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::MemfdFlags;
 use rustix::mm::{MapFlags, ProtFlags};
 use x11rb::connection::Connection;
@@ -147,6 +145,21 @@ impl Output {
             width: width.into(),
             height: height.into(),
         })
+    }
+
+    /// i3's IPC socket path from the root window's I3_SOCKET_PATH property, for when $I3SOCK isn't set.
+    pub fn i3_socket_path(&self) -> Option<String> {
+        let atom = self.conn.intern_atom(true, b"I3_SOCKET_PATH").ok()?.reply().ok()?.atom;
+        if atom == x11rb::NONE {
+            return None;
+        }
+        let reply = self.conn.get_property(false, self.root, atom, AtomEnum::ANY, 0, 1024).ok()?.reply().ok()?;
+        String::from_utf8(reply.value).ok().filter(|p| !p.is_empty())
+    }
+
+    /// The X connection, readable when events arrive.
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.conn.stream().as_fd()
     }
 
     pub fn kind(&self) -> &'static str {
@@ -338,16 +351,5 @@ impl Output {
             }
         }
         Ok(exposed)
-    }
-
-    /// Block until the X connection is readable or `timeout` passes (None: no timeout).
-    pub fn wait(&self, timeout: Option<Duration>) -> Result<()> {
-        let timespec = timeout.map(|d| Timespec { tv_sec: d.as_secs() as _, tv_nsec: d.subsec_nanos() as _ });
-        let fd = self.conn.stream().as_fd();
-        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-        match rustix::event::poll(&mut fds, timespec.as_ref()) {
-            Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
     }
 }

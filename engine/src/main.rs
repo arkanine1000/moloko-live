@@ -3,34 +3,50 @@
 //! Each frame only the canvas rectangles a timeline step changed are recomposited, converted through the palette
 //! LUT at native size and uploaded; the X server then scales them onto the output in one grabbed burst (see
 //! output.rs). Between steps the process sleeps in poll until the next one is due.
+//!
+//! Animation runs only while the desktop can be seen (i3), the machine is on mains, and the CPU is below --max-temp.
+//! Otherwise every timer stops, the last frame stays on screen, and the process waits for events.
 
+mod i3;
 mod output;
 mod pack;
+mod power;
 mod render;
 
+use std::os::fd::BorrowedFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use output::{Output, Target};
 use pack::Rect;
+use power::{Power, Thermal};
 use render::{Fit, Geometry};
+use rustix::event::{PollFd, PollFlags, Timespec};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "usage: molokolive [options]
 
-  --scene NAME     scene pack to show (default cg_firefly)
-  --packs DIR      directory of packs from tools/pack.py (default rip/packs)
-  --palette NAME   palette LUT from the pack (default neutral-lift)
-  --fit MODE       cover: fill the screen, cropping overflow (default); contain: letterbox
-  --output MODE    auto (default): window under a compositor, else root; window: desktop window;
-                   root: root background pixmap
-  --sky N          skybox still N (its game file number) instead of a random one from the pool
-  --max-fps F      shortest hold is 1/F s (default 20, the game's fastest animations)
-  --max-rects N    most separate draws per frame; beyond that the dirty area is covered by N strips (default 16)
-  --once           set the first frame as the root background and exit
-  --stats          print frame counts and per-stage timings every 10 s while animating";
+  --scene NAME       scene pack to show (default cg_firefly)
+  --packs DIR        directory of packs from tools/pack.py (default rip/packs)
+  --palette NAME     palette LUT from the pack (default neutral-lift)
+  --fit MODE         cover: fill the screen, cropping overflow (default); contain: letterbox
+  --output MODE      auto (default): window under a compositor, else root; window: desktop window;
+                     root: root background pixmap
+  --sky N            skybox still N (its game file number) instead of a random one from the pool
+  --max-fps F        shortest hold is 1/F s (default 20, the game's fastest animations)
+  --max-rects N      most separate draws per frame; beyond that the dirty area is covered by N strips (default 16)
+  --max-temp C       stop at or above C °C (x86_pkg_temp), resume 5 °C below (default: no limit)
+  --ignore-covered   keep animating when windows cover the desktop
+  --ignore-battery   keep animating on battery
+  --once             set the first frame as the root background and exit
+  --stats            print frame counts and per-stage timings every 10 s while animating";
+
+/// How often the temperature is read while animating, or while stopped for heat.
+const TEMPERATURE_INTERVAL: Duration = Duration::from_secs(5);
+/// How long to wait before reconnecting after i3 restarts.
+const I3_RETRY: Duration = Duration::from_secs(2);
 
 struct Args {
     scene: String,
@@ -41,8 +57,39 @@ struct Args {
     sky: Option<u32>,
     max_fps: f64,
     max_rects: usize,
+    max_temp: Option<i32>,
+    ignore_covered: bool,
+    ignore_battery: bool,
     once: bool,
     stats: bool,
+}
+
+/// Why animation is stopped, if it is.
+#[derive(Clone, Copy, Default)]
+struct Stops {
+    covered: bool,
+    battery: bool,
+    hot: Option<i32>,
+}
+
+impl Stops {
+    fn running(&self) -> bool {
+        !self.covered && !self.battery && self.hot.is_none()
+    }
+
+    fn describe(&self) -> String {
+        let mut reasons = Vec::new();
+        if self.covered {
+            reasons.push("desktop covered".to_string());
+        }
+        if self.battery {
+            reasons.push("on battery".to_string());
+        }
+        if let Some(c) = self.hot {
+            reasons.push(format!("too hot ({c} °C)"));
+        }
+        if reasons.is_empty() { "animating".into() } else { format!("paused: {}", reasons.join(", ")) }
+    }
 }
 
 /// xorshift64: hold choices and pools only need to look random.
@@ -78,6 +125,7 @@ fn run() -> Result<()> {
     let mut rng = Rng::seeded();
     let dir = args.packs.join(&args.scene);
     let mut scene = pack::load(&dir, &args.palette, &mut |name, sources| choose(name, sources, args.sky, &mut rng))?;
+    let thermal = args.max_temp.map(Thermal::open).transpose()?;
     let loaded = started.elapsed();
 
     let mut output = Output::connect(args.output)?;
@@ -108,6 +156,39 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    // What may stop animation, and its state now.
+    let i3_path = std::env::var("I3SOCK").ok().filter(|p| !p.is_empty()).or_else(|| output.i3_socket_path());
+    let mut i3 = None;
+    let mut i3_retry = None;
+    if !args.ignore_covered {
+        match &i3_path {
+            Some(path) => match i3::I3::connect(path) {
+                Ok(connection) => i3 = Some(connection),
+                Err(e) => {
+                    eprintln!("molokolive: {e}; retrying");
+                    i3_retry = Some(Instant::now() + I3_RETRY);
+                }
+            },
+            None => eprintln!("molokolive: i3 not found ($I3SOCK, I3_SOCKET_PATH); a covered desktop won't pause"),
+        }
+    }
+    let power = (!args.ignore_battery).then(Power::open);
+    let mut stops = Stops {
+        covered: match i3.as_mut() {
+            Some(connection) => !connection.desktop_visible()?,
+            None => false,
+        },
+        battery: power.as_ref().is_some_and(Power::on_battery),
+        hot: None,
+    };
+    if let Some(t) = &thermal {
+        let celsius = t.celsius()?;
+        stops.hot = t.too_hot(celsius, false).then_some(celsius);
+    }
+    let mut next_temperature = Instant::now() + TEMPERATURE_INTERVAL;
+    let mut running = stops.running();
+    println!("{}", stops.describe());
+
     let min_hold = Duration::from_secs_f64(1.0 / args.max_fps);
     let now = Instant::now();
     for animation in scene.layers.iter_mut().filter_map(|l| l.animation.as_mut()) {
@@ -117,12 +198,14 @@ fn run() -> Result<()> {
     let [mut t_composite, mut t_convert, mut t_x] = [Duration::ZERO; 3];
     let (mut dirty, mut shown) = (Vec::new(), Vec::new());
     loop {
-        let now = Instant::now();
-        let width = scene.width;
-        for layer in &mut scene.layers {
-            let Some(animation) = layer.animation.as_mut() else { continue };
-            while animation.due.is_some_and(|due| due <= now) {
-                animation.advance(&mut layer.pixels, width, now, &mut rng, min_hold, &mut dirty);
+        if running {
+            let now = Instant::now();
+            let width = scene.width;
+            for layer in &mut scene.layers {
+                let Some(animation) = layer.animation.as_mut() else { continue };
+                while animation.due.is_some_and(|due| due <= now) {
+                    animation.advance(&mut layer.pixels, width, now, &mut rng, min_hold, &mut dirty);
+                }
             }
         }
         if !dirty.is_empty() {
@@ -170,6 +253,26 @@ fn run() -> Result<()> {
                 [t_composite, t_convert, t_x] = [Duration::ZERO; 3];
             }
         }
+
+        // Sleep until something is due: the next animation step while running, a temperature reading while only heat
+        // could be stopping us, an i3 reconnect attempt. With none of those, block on events alone.
+        let checking_heat = thermal.is_some() && !stops.covered && !stops.battery;
+        let deadline = [
+            if running { scene.layers.iter().filter_map(|l| l.animation.as_ref()?.due).min() } else { None },
+            checking_heat.then_some(next_temperature),
+            i3_retry,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        {
+            let fds: Vec<BorrowedFd> = [Some(output.fd()), i3.as_ref().map(|c| c.fd()), power.as_ref().and_then(Power::fd)]
+                .into_iter()
+                .flatten()
+                .collect();
+            wait(&fds, deadline.map(|d| d.saturating_duration_since(Instant::now())))?;
+        }
+
         let exposed = output.drain_events()?;
         if !exposed.is_empty() {
             for area in exposed {
@@ -178,8 +281,65 @@ fn run() -> Result<()> {
             }
             output.sync()?;
         }
-        let next = scene.layers.iter().filter_map(|l| l.animation.as_ref()?.due).min();
-        output.wait(next.map(|due| due.saturating_duration_since(Instant::now())))?;
+
+        let blocked_before = stops.covered || stops.battery;
+        if let Some(connection) = i3.as_mut() {
+            match connection.drain()? {
+                i3::Events::None => {}
+                i3::Events::Changed => stops.covered = !connection.desktop_visible()?,
+                i3::Events::Lost => {
+                    // i3 is restarting: keep the last known state until it's back.
+                    i3 = None;
+                    i3_retry = Some(Instant::now() + I3_RETRY);
+                }
+            }
+        }
+        if let (None, Some(retry), Some(path)) = (&i3, i3_retry, &i3_path)
+            && retry <= Instant::now()
+        {
+            match i3::I3::connect(path) {
+                Ok(mut connection) => {
+                    stops.covered = !connection.desktop_visible()?;
+                    i3 = Some(connection);
+                    i3_retry = None;
+                }
+                Err(_) => i3_retry = Some(Instant::now() + I3_RETRY),
+            }
+        }
+        if let Some(p) = &power
+            && p.drain()
+        {
+            stops.battery = p.on_battery();
+        }
+        if let Some(t) = &thermal {
+            let unblocked = blocked_before && !stops.covered && !stops.battery;
+            if !stops.covered && !stops.battery && (unblocked || Instant::now() >= next_temperature) {
+                let celsius = t.celsius()?;
+                stops.hot = t.too_hot(celsius, stops.hot.is_some()).then_some(celsius);
+                next_temperature = Instant::now() + TEMPERATURE_INTERVAL;
+            }
+        }
+
+        if stops.running() != running {
+            running = stops.running();
+            println!("{}", stops.describe());
+            if running {
+                let now = Instant::now();
+                for animation in scene.layers.iter_mut().filter_map(|l| l.animation.as_mut()) {
+                    animation.resume(now, &mut rng, min_hold);
+                }
+            }
+        }
+    }
+}
+
+/// Block until any descriptor is readable or `timeout` passes (None: no timeout).
+fn wait(fds: &[BorrowedFd], timeout: Option<Duration>) -> Result<()> {
+    let timespec = timeout.map(|d| Timespec { tv_sec: d.as_secs() as _, tv_nsec: d.subsec_nanos() as _ });
+    let mut polled: Vec<PollFd> = fds.iter().map(|fd| PollFd::new(fd, PollFlags::IN)).collect();
+    match rustix::event::poll(&mut polled, timespec.as_ref()) {
+        Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -229,6 +389,9 @@ fn parse_args() -> Result<Args> {
         sky: None,
         max_fps: 20.0,
         max_rects: 16,
+        max_temp: None,
+        ignore_covered: false,
+        ignore_battery: false,
         once: false,
         stats: false,
     };
@@ -257,6 +420,12 @@ fn parse_args() -> Result<Args> {
             "--sky" => args.sky = Some(value()?.parse()?),
             "--max-fps" => args.max_fps = value()?.parse::<f64>()?.max(0.1),
             "--max-rects" => args.max_rects = value()?.parse::<usize>()?.max(1),
+            "--max-temp" => {
+                let raw = value()?;
+                args.max_temp = Some(raw.parse().map_err(|_| format!("--max-temp {raw}: expected whole degrees C, e.g. 80"))?);
+            }
+            "--ignore-covered" => args.ignore_covered = true,
+            "--ignore-battery" => args.ignore_battery = true,
             "--once" => args.once = true,
             "--stats" => args.stats = true,
             "-h" | "--help" => {

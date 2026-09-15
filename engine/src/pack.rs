@@ -225,6 +225,13 @@ impl Animation {
         self.due = Some(now + hold(&self.steps[0].holds, rng, min_hold));
     }
 
+    /// Continue after a pause: the current image stays and its hold starts over, so nothing is replayed.
+    pub fn resume(&mut self, now: Instant, rng: &mut Rng, min_hold: Duration) {
+        if self.due.is_some() {
+            self.due = Some(now + hold(&self.steps[self.current].holds, rng, min_hold));
+        }
+    }
+
     /// Enter the next step: patch `pixels` (canvas `width` wide) and add the changed rectangles to `dirty`.
     pub fn advance(&mut self, pixels: &mut [u8], width: usize, now: Instant, rng: &mut Rng, min_hold: Duration, dirty: &mut Vec<Rect>) {
         let Some(due) = self.due else { return };
