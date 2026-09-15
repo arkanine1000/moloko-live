@@ -1,91 +1,157 @@
 # molokolive
 
-A live wallpaper engine themed on Nikita Kryukov's *Milk inside a bag of milk* games, meant to be extremely
-light on CPU, GPU and battery (palette cycling on indexed art, low internal resolution, low frame rate, pausing
-when the desktop is hidden).
+Animated scenes from Nikita Kryukov's *Milk outside a bag of milk outside a bag of milk* as your desktop wallpaper,
+on X11 with i3. The scenes play with the game's own timings, in a cool, desaturated palette, and the skies drift
+slowly the way they do in the game.
 
-**The wallpaper engine is in progress.** It plays the game's scenes with their own timings, drawing only what
-changes (including the skies' slow drift), and pauses when windows cover the desktop, on battery, or above
-`--max-temp`. It shuffles through the scenes on a timer and takes commands from i3 keybinds.
+It is built to cost next to nothing: it draws only the pixels that change, and it pauses while windows cover the
+desktop, while the laptop runs on battery, and (if you ask) while the CPU is hot.
 
-## Wallpaper engine
+No game files are included. You need your own copy of the game.
 
-`tools/pack.py` turns the game's scene definitions and art into scene packs under `rip/packs/`: indexed layers,
-timelines with dirty rectangles, and one palette LUT per palette. `engine/` (Rust) plays a pack behind the
-desktop.
+## Requirements
 
-```sh
-python tools/pack.py                          # every scene -> rip/packs/<scene>/
-cargo build --release --manifest-path engine/Cargo.toml
-cargo install --path engine --root ~/.local  # -> ~/.local/bin/molokolive
-molokolive --packs "$PWD/rip/packs"            # run: shuffle, 60 s autoplay, neutral-lift
-molokolive next                                # prev, sky-next, sky-prev, pause, resume, status
-molokolive --help                              # scenes, autoplay, skyboxes, fit, output, limits
+- Linux with X11, the i3 window manager, and a compositor such as picom
+- The game, from Steam (app 1604000)
+- Rust, to build the wallpaper
+- Python 3, for the tools that prepare the scenes
+- ffmpeg, only if you want to render a showreel video
+
+## Quick start
+
+1. Set up Python. The repository uses direnv and pyenv:
+
+   ```sh
+   pyenv install 3.14.6
+   direnv allow
+   pip install -r requirements.txt
+   ```
+
+2. Extract the game's files into `rip/`. If Steam keeps the game somewhere else, set `GAME` to its folder:
+
+   ```sh
+   tools/rip.sh
+   ```
+
+3. Build the scenes. They go to `~/.local/share/molokolive/packs`:
+
+   ```sh
+   python tools/pack.py
+   ```
+
+4. Install the wallpaper and start it:
+
+   ```sh
+   cargo install --path engine --root ~/.local
+   molokolive
+   ```
+
+## Controls
+
+While the wallpaper runs, `molokolive` followed by a command controls it. The keys are the ones in the
+[i3 setup](#i3) below.
+
+| Command | What it does | Key |
+|---|---|---|
+| `molokolive next` | show the next scene | Alt+' |
+| `molokolive prev` | go back to the scene before | Alt+; |
+| `molokolive sky-next` | change the current scene's sky | Alt+Shift+' |
+| `molokolive sky-prev` | change it back | Alt+Shift+; |
+| `molokolive pause` / `resume` | pause or resume the animation | |
+| `molokolive status` | show the scene, its sky, and whether it's paused | |
+
+On its own, the wallpaper changes scene after every 60 seconds of animation, in random order, each time with a
+random sky.
+
+## Options
+
+The ones you're most likely to want. `molokolive --help` lists them all, and `--help-all` adds the advanced ones.
+
+| Option | What it does |
+|---|---|
+| `--autoplay SECONDS` | how long each scene plays; `--autoplay off` stays on one scene (default: 60) |
+| `--scenes A,B,...` | rotate through these scenes only |
+| `--start-scene NAME` | start with this scene |
+| `--persist-sky` | give each scene back the sky it had last time |
+| `--no-drift` | keep the skies still |
+| `--max-temp DEGREES` | also pause while the CPU is at least this hot, in °C |
+| `--palette NAME` | colour palette (default: `neutral-lift`) |
+
+The scenes are `cg_ceiling`, `cg_dream`, `cg_eyelash`, `cg_fall_close`, `cg_fall_far`, `cg_firefly`, `cg_floor`,
+`cg_mirror`, `cg_mirror_brush`, `cg_pills`, `mini_cg_1`, `mini_cg_door`, `mini_cg_eyes`, `mini_cg_momp` and
+`mini_cg_run`.
+
+## i3
+
+Add this to your i3 config:
+
 ```
+exec --no-startup-id molokolive --output window
+bindsym $mod+semicolon exec --no-startup-id molokolive prev
+bindsym $mod+apostrophe exec --no-startup-id molokolive next
+bindsym $mod+Shift+semicolon exec --no-startup-id molokolive sky-prev
+bindsym $mod+Shift+apostrophe exec --no-startup-id molokolive sky-next
+```
+
+- `exec` starts the wallpaper once per login, so reloading i3 doesn't restart the scene rotation.
+- `--output window` is needed because picom may not be running yet at the moment i3 starts the wallpaper.
+- Keep your usual wallpaper command (for example feh): its picture shows whenever molokolive isn't running.
+
+## Palettes
+
+The default palette, `neutral-lift`, comes from scenes recoloured by hand: `tools/recolor_scene.py` matches each
+recoloured screenshot to its scene and fits a rule for the colours, which then applies to every scene.
+
+To make your own palette:
+
+1. Paint over a 1920x1080 screenshot of a scene and save it under `rip/recolours/`.
+2. Fit the palette: `python tools/recolor_scene.py rip/recolours/mine.png:cg_dream --name mine`
+3. Rebuild the scenes with it: `python tools/pack.py --palette mine neutral-lift`
+4. Use it: `molokolive --palette mine`
+
+## Tools
+
+Each tool explains itself with `--help`.
+
+| Tool | What it does |
+|---|---|
+| `tools/rip.sh` | extract the game's files into `rip/` (videos are skipped) |
+| `tools/pack.py` | build the scenes the wallpaper plays |
+| `tools/recolor_scene.py` | fit a palette to recoloured scene screenshots |
+| `tools/showreel.py` | render every scene into one video, as the wallpaper would play it |
+| `tools/palettes.py` | extract, swap and neutralize the palettes of PNG images |
+| `tools/recolor_palette.py` | build a palette from a recoloured Milk-chan sprite |
+| `tools/dialogue.py` | extract Milk-chan's English dialogue into `rip/dialogue/` |
 
 ## Milk-chan demo
 
-`apps/milkchan.py` is a playground for testing and reference only, not the wallpaper engine. It rebuilds
-Milk-chan from the game's own sprite definitions and reproduces the game's behaviour closely enough to
-compare against. It covers:
+`apps/milkchan.py` is a playground for trying out Milk-chan outside the game. It is not part of the wallpaper. It
+rebuilds her from the game's own sprite definitions and behaves closely enough to the game to compare against:
 
-- Pose, emotion and mood selection, idle blink, and frame-by-frame stepping.
-- The game's say screen: textbox, Retro Gaming font, 30 cps typewriter, and the talk logic (mouth flaps and a
-  looping sound while typing, 0.3 s fadeout after).
-- Runtime palettes (`palettes/`), including exact colour-map palettes built from hand recolours.
-- Reactive mode (PoC): comments on the artist mpd is playing, with one line, pose, emotion, mood and
-  optional eye state per artist, held while the line types out (`apps/milkchan_reactive.json`). A new song by the same artist doesn't
-  retrigger. `--reactive-check` validates the map
-  against the sprites and resolves every song in the library.
-- Sharp fill or pixel-perfect scaling.
+- poses, emotions and moods, blinking, and stepping through frames
+- the game's text box: font, typewriter speed, mouth movement and the talking sound
+- the palettes from `palettes/`
+- a reactive mode that comments on the artist mpd is playing, from `apps/milkchan_reactive.json`; the same artist
+  doesn't trigger a comment twice in a row
 
 ```sh
-python apps/milkchan.py           # GUI; key help is in the window title
-python apps/milkchan.py --list    # all sprites
+python tools/dialogue.py                  # once, for the demo's dialogue
+python apps/milkchan.py                   # window; the keys are listed in its title bar
+python apps/milkchan.py --list            # every sprite
 python apps/milkchan.py --render out.png --pose arms_down --emotion smile --mood 2
 ```
 
-## Layout
+## Repository
 
-| Path | What |
+| Path | Contents |
 |---|---|
-| `engine/` | Wallpaper engine (Rust) |
-| `tools/pack.py` | Scene pack builder for the engine |
-| `apps/milkchan.py` | Milk-chan demo (playground) |
-| `apps/milkchan_lines.json` | Demo dialogue picks, as line ids only |
-| `apps/milkchan_reactive.json` | Reactive mode: per-artist lines and sprites, aliases, composer keywords |
-| `tools/rip.sh` | Extract the game's `archive.rpa` into `rip/` (videos skipped) |
-| `tools/dialogue.py` | Milk-chan's spoken English dialogue, tagged with the sprite shown |
-| `tools/palettes.py` | Extract, swap and neutralize PNG palettes |
-| `tools/recolor_palette.py` | Build a colour-map palette from a hand-recoloured sprite |
-| `tools/recolor_scene.py` | Fit a lift-rule palette (`neutral-lift`) to hand-recoloured scene frames |
-| `tools/showreel.py` | Render scene packs into a showreel video under `rip/showreel/` |
-| `palettes/` | Palettes: `*.hex` lists, `*.json` colour maps, swatches |
-| `rip/` | Extracted game assets, dialogue and recolours (**gitignored**, never commit) |
+| `engine/` | the wallpaper (Rust) |
+| `tools/` | the tools above |
+| `palettes/` | palettes: `*.hex` colour lists, `*.json` colour maps and fitted rules |
+| `apps/` | the Milk-chan demo and its data |
+| `rip/` | files extracted from the game, recolours and showreels; ignored by git |
 
-## Setup
-
-The Python environment comes from direnv and pyenv (`.envrc`: `layout pyenv 3.14.6`). Python needs tkinter.
-
-```sh
-pyenv install 3.14.6
-direnv allow
-pip install -r requirements.txt
-```
-
-## Game assets
-
-No game assets are included. You need your own copy of *Milk outside a bag of milk outside a bag of milk*
-(Steam app 1604000, Ren'Py 7.3.5):
-
-```sh
-tools/rip.sh                 # -> rip/raw (full archive), rip/frames (images only)
-python tools/dialogue.py     # -> rip/dialogue/milkchan_en.{jsonl,txt}
-```
-
-Everything extracted from the game stays in `rip/`, which is gitignored. Recolours of game art belong there too.
-
-## Commits
-
-Scoped [Conventional Commits](https://www.conventionalcommits.org/) across the repository, e.g.
-`feat(milkchan): add dialogue mode` or `fix(palettes): skip metadata json`.
+Nothing from the game is ever committed: extracted files stay in `rip/`, and the scene packs live in
+`~/.local/share/molokolive`.
+Commits follow scoped [Conventional Commits](https://www.conventionalcommits.org/), for example
+`feat(engine): pause on battery`.
