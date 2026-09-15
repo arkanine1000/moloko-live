@@ -6,15 +6,20 @@
 //!
 //! Animation runs only while the desktop can be seen (i3), the machine is on mains, and the CPU is below --max-temp.
 //! Otherwise every timer stops, the last frame stays on screen, and the process waits for events.
+//!
+//! Scenes rotate in a shuffle: after --autoplay seconds of animation, or on `molokolive next`/`prev`, with a random
+//! skybox each time (or each scene's last one, with --persist-skybox). The same binary sends those commands.
 
+mod control;
 mod i3;
 mod output;
 mod pack;
 mod power;
 mod render;
 
+use std::collections::HashMap;
 use std::os::fd::BorrowedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,31 +31,47 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "usage: molokolive [options]
+const USAGE: &str = "usage: molokolive [options]            run the engine
+       molokolive COMMAND              control the running engine
 
-  --scene NAME       scene pack to show (default cg_firefly)
+Commands:
+  next, prev         the next scene in the shuffle, or back through the scenes shown
+  sky-next, sky-prev the current scene's next or previous skybox
+  pause, resume      stop or restart animation by hand
+  status             the scene, its skybox, and whether and why it is paused
+
+Options:
   --packs DIR        directory of packs from tools/pack.py (default rip/packs)
-  --palette NAME     palette LUT from the pack (default neutral-lift)
+  --scenes A,B,...   scenes to rotate through (default: every pack in --packs)
+  --scene NAME       scene to start with (default: a random one)
+  --autoplay SECS    next scene after SECS seconds of animation, or off (default 60)
+  --persist-skybox   each scene keeps its last skybox instead of a random one
+  --sky N            start with skybox still N (its game file number)
+  --palette NAME     palette LUT from the packs (default neutral-lift)
   --fit MODE         cover: fill the screen, cropping overflow (default); contain: letterbox
   --output MODE      auto (default): window under a compositor, else root; window: desktop window;
                      root: root background pixmap
-  --sky N            skybox still N (its game file number) instead of a random one from the pool
   --max-fps F        shortest hold is 1/F s (default 20, the game's fastest animations)
   --max-rects N      most separate draws per frame; beyond that the dirty area is covered by N strips (default 16)
   --max-temp C       stop at or above C °C (x86_pkg_temp), resume 5 °C below (default: no limit)
   --ignore-covered   keep animating when windows cover the desktop
   --ignore-battery   keep animating on battery
-  --once             set the first frame as the root background and exit
+  --once             set the first scene's first frame as the root background and exit
   --stats            print frame counts and per-stage timings every 10 s while animating";
 
 /// How often the temperature is read while animating, or while stopped for heat.
 const TEMPERATURE_INTERVAL: Duration = Duration::from_secs(5);
 /// How long to wait before reconnecting after i3 restarts.
 const I3_RETRY: Duration = Duration::from_secs(2);
+/// Scenes remembered for `prev`.
+const HISTORY: usize = 100;
 
 struct Args {
-    scene: String,
     packs: PathBuf,
+    scenes: Option<Vec<String>>,
+    scene: Option<String>,
+    autoplay: Option<Duration>,
+    persist_skybox: bool,
     palette: String,
     fit: Fit,
     output: Target,
@@ -70,15 +91,19 @@ struct Stops {
     covered: bool,
     battery: bool,
     hot: Option<i32>,
+    manual: bool,
 }
 
 impl Stops {
     fn running(&self) -> bool {
-        !self.covered && !self.battery && self.hot.is_none()
+        !self.covered && !self.battery && self.hot.is_none() && !self.manual
     }
 
     fn describe(&self) -> String {
         let mut reasons = Vec::new();
+        if self.manual {
+            reasons.push("by hand".to_string());
+        }
         if self.covered {
             reasons.push("desktop covered".to_string());
         }
@@ -92,7 +117,7 @@ impl Stops {
     }
 }
 
-/// xorshift64: hold choices and pools only need to look random.
+/// xorshift64: hold choices, pools and the shuffle only need to look random.
 pub struct Rng(u64);
 
 impl Rng {
@@ -109,8 +134,174 @@ impl Rng {
     }
 }
 
+/// Scene order: a shuffled deck, dealt again once every scene has shown, with a history for `prev`.
+struct Rotation {
+    scenes: Vec<String>,
+    deck: Vec<String>,
+    history: Vec<String>,
+    position: usize,
+}
+
+impl Rotation {
+    fn new(scenes: Vec<String>, first: Option<String>, rng: &mut Rng) -> Rotation {
+        let mut rotation = Rotation { scenes, deck: Vec::new(), history: Vec::new(), position: 0 };
+        let first = match first {
+            Some(name) => {
+                // The starting scene has shown: deal the rest of the first deck without it.
+                rotation.deal_deck(rng);
+                rotation.deck.retain(|s| *s != name);
+                name
+            }
+            None => rotation.deal(rng),
+        };
+        rotation.history.push(first);
+        rotation
+    }
+
+    fn current(&self) -> &str {
+        &self.history[self.position]
+    }
+
+    /// Forward through the history, or a new scene from the deck.
+    fn next(&mut self, rng: &mut Rng) -> String {
+        if self.position + 1 < self.history.len() {
+            self.position += 1;
+        } else {
+            let scene = self.deal(rng);
+            self.history.push(scene);
+            if self.history.len() > HISTORY {
+                self.history.remove(0);
+            }
+            self.position = self.history.len() - 1;
+        }
+        self.current().to_string()
+    }
+
+    /// Back through the history; None at its start.
+    fn prev(&mut self) -> Option<String> {
+        self.position = self.position.checked_sub(1)?;
+        Some(self.current().to_string())
+    }
+
+    fn deal_deck(&mut self, rng: &mut Rng) {
+        self.deck = self.scenes.clone();
+        for i in (1..self.deck.len()).rev() {
+            self.deck.swap(i, rng.below(i + 1));
+        }
+    }
+
+    fn deal(&mut self, rng: &mut Rng) -> String {
+        if self.deck.is_empty() {
+            self.deal_deck(rng);
+        }
+        // Never the scene already showing, when there is another.
+        if self.deck.len() > 1 && self.history.get(self.position) == self.deck.last() {
+            let last = self.deck.len() - 1;
+            self.deck.swap(0, last);
+        }
+        self.deck.pop().unwrap_or_else(|| self.scenes[0].clone())
+    }
+}
+
+/// The scene on screen and everything derived from it.
+struct Show {
+    name: String,
+    scene: pack::Scene,
+    geometry: Geometry,
+    frame: Vec<u8>,
+    visible: Option<Rect>,
+    letterbox: Vec<Rect>,
+    background: [u8; 4],
+}
+
+impl Show {
+    /// Load a scene, picking each pool's image: `sky` for the sky layer if given, the scene's remembered image with
+    /// --persist-skybox, else a random one. Records the picks. Doesn't touch the output.
+    fn open(
+        args: &Args,
+        name: &str,
+        output: &Output,
+        rng: &mut Rng,
+        skies: &mut HashMap<(String, String), usize>,
+        sky: Option<u32>,
+    ) -> Result<Show> {
+        let mut pick = |layer: &str, sources: &[String]| -> Result<usize> {
+            if let (Some(n), "sky") = (sky, layer) {
+                let file = format!("{n}.png");
+                return sources
+                    .iter()
+                    .position(|s| s.rsplit('/').next() == Some(file.as_str()))
+                    .ok_or_else(|| format!("--sky {n}: not in {name}'s pool").into());
+            }
+            if args.persist_skybox
+                && let Some(&index) = skies.get(&(name.to_string(), layer.to_string()))
+                && index < sources.len()
+            {
+                return Ok(index);
+            }
+            Ok(rng.below(sources.len()))
+        };
+        let scene = pack::load(&args.packs.join(name), &args.palette, &mut pick)?;
+        for (layer, index) in scene.choices() {
+            skies.insert((name.to_string(), layer), index);
+        }
+        let geometry = Geometry::new(scene.width, scene.height, output.width, output.height, args.fit);
+        let canvas = Rect { x0: 0, y0: 0, x1: scene.width, y1: scene.height };
+        let mut frame = vec![scene.background; scene.width * scene.height];
+        scene.composite(&mut frame, canvas);
+        Ok(Show {
+            name: name.to_string(),
+            visible: geometry.to_output(&canvas),
+            letterbox: geometry.letterbox(),
+            background: scene.lut[scene.background as usize],
+            geometry,
+            frame,
+            scene,
+        })
+    }
+
+    fn canvas(&self) -> Rect {
+        Rect { x0: 0, y0: 0, x1: self.scene.width, y1: self.scene.height }
+    }
+
+    /// Give the output a source picture for this scene and upload the whole canvas into it.
+    fn upload(&self, output: &mut Output) -> Result<()> {
+        output.prepare(self.scene.width, self.scene.height, &self.geometry)?;
+        let canvas = self.canvas();
+        render::convert(&self.frame, self.scene.width, canvas, &self.scene.lut, output.image(0, canvas.area() * 4));
+        output.upload(canvas, 0)
+    }
+
+    fn start(&mut self, rng: &mut Rng, min_hold: Duration) {
+        let now = Instant::now();
+        for animation in self.scene.layers.iter_mut().filter_map(|l| l.animation.as_mut()) {
+            animation.start(now, rng, min_hold);
+        }
+    }
+
+    fn describe(&self) -> String {
+        let picks = self.scene.picks();
+        if picks.is_empty() { self.name.clone() } else { format!("{} ({picks})", self.name) }
+    }
+}
+
 fn main() -> ExitCode {
-    match run() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let [command] = argv.as_slice()
+        && control::COMMANDS.contains(&command.as_str())
+    {
+        return match control::send(command) {
+            Ok(reply) => {
+                println!("{reply}");
+                if reply.starts_with("error") { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+            }
+            Err(e) => {
+                eprintln!("molokolive: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match parse_args(argv).and_then(run) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("molokolive: {e}");
@@ -119,42 +310,42 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
-    let args = parse_args()?;
+fn run(args: Args) -> Result<()> {
     let started = Instant::now();
     let mut rng = Rng::seeded();
-    let dir = args.packs.join(&args.scene);
-    let mut scene = pack::load(&dir, &args.palette, &mut |name, sources| choose(name, sources, args.sky, &mut rng))?;
+    let scenes = match &args.scenes {
+        Some(list) => list.clone(),
+        None => available_scenes(&args.packs)?,
+    };
+    if let Some(missing) = scenes.iter().chain(&args.scene).find(|s| !args.packs.join(s).join("manifest.json").is_file()) {
+        return Err(format!("no pack {missing:?} in {} (run tools/pack.py)", args.packs.display()).into());
+    }
     let thermal = args.max_temp.map(Thermal::open).transpose()?;
-    let loaded = started.elapsed();
+    let mut rotation = Rotation::new(scenes, args.scene.clone(), &mut rng);
+    let mut skies = HashMap::new();
 
     let mut output = Output::connect(args.output)?;
-    let geometry = Geometry::new(scene.width, scene.height, output.width, output.height, args.fit);
-    output.prepare(scene.width, scene.height, &geometry)?;
-    let canvas = Rect { x0: 0, y0: 0, x1: scene.width, y1: scene.height };
-    let (visible, letterbox, background) = (geometry.to_output(&canvas), geometry.letterbox(), scene.lut[scene.background as usize]);
-    let mut frame = vec![scene.background; scene.width * scene.height];
-    scene.composite(&mut frame, canvas);
-    render::convert(&frame, scene.width, canvas, &scene.lut, output.image(0, canvas.area() * 4));
-    output.upload(canvas, 0)?;
-    output.publish(visible, &letterbox, background)?;
-    let animated = scene.layers.iter().filter(|l| l.animation.is_some()).count();
+    let mut show = Show::open(&args, rotation.current(), &output, &mut rng, &mut skies, args.sky)?;
+    show.upload(&mut output)?;
+    output.publish(show.visible, &show.letterbox, show.background)?;
+    let animated = show.scene.layers.iter().filter(|l| l.animation.is_some()).count();
     println!(
-        "{}: canvas {}x{} -> {}x{} at x{:.3} on the {}, {} layers ({animated} animated), load {:.1} ms, first frame {:.1} ms",
-        args.scene,
-        scene.width,
-        scene.height,
-        geometry.width,
-        geometry.height,
-        geometry.scale,
+        "{}: canvas {}x{} -> {}x{} at x{:.3} on the {}, {} layers ({animated} animated), ready in {:.1} ms",
+        show.describe(),
+        show.scene.width,
+        show.scene.height,
+        show.geometry.width,
+        show.geometry.height,
+        show.geometry.scale,
         output.kind(),
-        scene.layers.len(),
-        ms(loaded),
-        ms(started.elapsed() - loaded)
+        show.scene.layers.len(),
+        ms(started.elapsed())
     );
     if args.once {
         return Ok(());
     }
+    // Publishing has ended any engine that was running, so the socket is ours to take.
+    let server = control::Server::bind()?;
 
     // What may stop animation, and its state now.
     let i3_path = std::env::var("I3SOCK").ok().filter(|p| !p.is_empty()).or_else(|| output.i3_socket_path());
@@ -180,6 +371,7 @@ fn run() -> Result<()> {
         },
         battery: power.as_ref().is_some_and(Power::on_battery),
         hot: None,
+        manual: false,
     };
     if let Some(t) = &thermal {
         let celsius = t.celsius()?;
@@ -190,18 +382,34 @@ fn run() -> Result<()> {
     println!("{}", stops.describe());
 
     let min_hold = Duration::from_secs_f64(1.0 / args.max_fps);
-    let now = Instant::now();
-    for animation in scene.layers.iter_mut().filter_map(|l| l.animation.as_mut()) {
-        animation.start(now, &mut rng, min_hold);
-    }
+    show.start(&mut rng, min_hold);
+    // Animation time on the current scene, which is what --autoplay counts.
+    let (mut played, mut last_tick) = (Duration::ZERO, Instant::now());
     let (mut frames, mut rects, mut pixels, mut report) = (0u64, 0u64, 0u64, Instant::now());
     let [mut t_composite, mut t_convert, mut t_x] = [Duration::ZERO; 3];
     let (mut dirty, mut shown) = (Vec::new(), Vec::new());
     loop {
+        let now = Instant::now();
+        if running {
+            played += now - last_tick;
+        }
+        last_tick = now;
+        if let Some(interval) = args.autoplay
+            && running
+            && played >= interval
+        {
+            let name = rotation.next(&mut rng);
+            if let Err(e) = change_scene(&args, &name, &mut output, &mut rng, &mut skies, &mut show, min_hold) {
+                eprintln!("molokolive: {e}");
+            }
+            (played, last_tick) = (Duration::ZERO, Instant::now());
+            dirty.clear();
+        }
+
         if running {
             let now = Instant::now();
-            let width = scene.width;
-            for layer in &mut scene.layers {
+            let width = show.scene.width;
+            for layer in &mut show.scene.layers {
                 let Some(animation) = layer.animation.as_mut() else { continue };
                 while animation.due.is_some_and(|due| due <= now) {
                     animation.advance(&mut layer.pixels, width, now, &mut rng, min_hold, &mut dirty);
@@ -214,17 +422,17 @@ fn run() -> Result<()> {
             let mut offset = 0;
             for rect in merge(&dirty, args.max_rects) {
                 let t0 = Instant::now();
-                scene.composite(&mut frame, rect);
+                show.scene.composite(&mut show.frame, rect);
                 let len = rect.area() * 4;
                 if offset + len > output.capacity() {
                     output.sync()?; // the server has read what we uploaded so far
                     offset = 0;
                 }
                 let t1 = Instant::now();
-                render::convert(&frame, scene.width, rect, &scene.lut, output.image(offset, len));
+                render::convert(&show.frame, show.scene.width, rect, &show.scene.lut, output.image(offset, len));
                 let t2 = Instant::now();
                 output.upload(rect, offset)?;
-                shown.extend(geometry.to_output(&rect));
+                shown.extend(show.geometry.to_output(&rect));
                 (t_composite, t_convert, t_x) = (t_composite + (t1 - t0), t_convert + (t2 - t1), t_x + t2.elapsed());
                 offset += len;
                 rects += 1;
@@ -254,11 +462,12 @@ fn run() -> Result<()> {
             }
         }
 
-        // Sleep until something is due: the next animation step while running, a temperature reading while only heat
-        // could be stopping us, an i3 reconnect attempt. With none of those, block on events alone.
+        // Sleep until something is due: the next animation step or scene change while running, a temperature reading
+        // while only heat could be stopping us, an i3 reconnect attempt. With none of those, block on events alone.
         let checking_heat = thermal.is_some() && !stops.covered && !stops.battery;
         let deadline = [
-            if running { scene.layers.iter().filter_map(|l| l.animation.as_ref()?.due).min() } else { None },
+            if running { show.scene.layers.iter().filter_map(|l| l.animation.as_ref()?.due).min() } else { None },
+            args.autoplay.filter(|_| running).map(|interval| Instant::now() + interval.saturating_sub(played)),
             checking_heat.then_some(next_temperature),
             i3_retry,
         ]
@@ -266,20 +475,65 @@ fn run() -> Result<()> {
         .flatten()
         .min();
         {
-            let fds: Vec<BorrowedFd> = [Some(output.fd()), i3.as_ref().map(|c| c.fd()), power.as_ref().and_then(Power::fd)]
-                .into_iter()
-                .flatten()
-                .collect();
+            let fds: Vec<BorrowedFd> =
+                [Some(output.fd()), Some(server.fd()), i3.as_ref().map(|c| c.fd()), power.as_ref().and_then(Power::fd)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
             wait(&fds, deadline.map(|d| d.saturating_duration_since(Instant::now())))?;
         }
 
         let exposed = output.drain_events()?;
         if !exposed.is_empty() {
             for area in exposed {
-                let bands: Vec<Rect> = letterbox.iter().filter_map(|b| b.intersect(&area)).collect();
-                output.paint(visible.and_then(|v| v.intersect(&area)), &bands, background)?;
+                let bands: Vec<Rect> = show.letterbox.iter().filter_map(|b| b.intersect(&area)).collect();
+                output.paint(show.visible.and_then(|v| v.intersect(&area)), &bands, show.background)?;
             }
             output.sync()?;
+        }
+
+        for request in server.accept() {
+            let reply = match request.command.as_str() {
+                "next" | "prev" => {
+                    let target = if request.command == "next" { Some(rotation.next(&mut rng)) } else { rotation.prev() };
+                    match target {
+                        None => format!("{} (no earlier scene)", show.describe()),
+                        Some(name) => match change_scene(&args, &name, &mut output, &mut rng, &mut skies, &mut show, min_hold) {
+                            Ok(()) => {
+                                (played, last_tick) = (Duration::ZERO, Instant::now());
+                                dirty.clear();
+                                show.describe()
+                            }
+                            Err(e) => format!("error: {e}"),
+                        },
+                    }
+                }
+                "sky-next" | "sky-prev" => {
+                    let step = if request.command == "sky-next" { 1 } else { -1 };
+                    match show.scene.step_choice("sky", step) {
+                        Ok(Some(index)) => {
+                            skies.insert((show.name.clone(), "sky".to_string()), index);
+                            dirty.push(show.canvas());
+                            show.describe()
+                        }
+                        Ok(None) => format!("{} has no skybox", show.name),
+                        Err(e) => format!("error: {e}"),
+                    }
+                }
+                "pause" | "resume" => {
+                    stops.manual = request.command == "pause";
+                    stops.describe()
+                }
+                "status" => {
+                    let autoplay = match args.autoplay {
+                        Some(interval) => format!("; next scene after {} s more animation", interval.saturating_sub(played).as_secs()),
+                        None => String::new(),
+                    };
+                    format!("{}: {}{autoplay}", show.describe(), stops.describe())
+                }
+                other => format!("error: unknown command {other:?} (commands: {})", control::COMMANDS.join(", ")),
+            };
+            request.reply(&reply);
         }
 
         let blocked_before = stops.covered || stops.battery;
@@ -325,12 +579,48 @@ fn run() -> Result<()> {
             println!("{}", stops.describe());
             if running {
                 let now = Instant::now();
-                for animation in scene.layers.iter_mut().filter_map(|l| l.animation.as_mut()) {
+                last_tick = now;
+                for animation in show.scene.layers.iter_mut().filter_map(|l| l.animation.as_mut()) {
                     animation.resume(now, &mut rng, min_hold);
                 }
             }
         }
     }
+}
+
+/// Replace the scene on screen with `name` (a hard cut). A pack that fails to load leaves the current scene up.
+fn change_scene(
+    args: &Args,
+    name: &str,
+    output: &mut Output,
+    rng: &mut Rng,
+    skies: &mut HashMap<(String, String), usize>,
+    show: &mut Show,
+    min_hold: Duration,
+) -> Result<()> {
+    let mut next = Show::open(args, name, output, rng, skies, None)?;
+    next.upload(output)?;
+    output.paint(next.visible, &next.letterbox, next.background)?;
+    output.sync()?;
+    next.start(rng, min_hold);
+    *show = next;
+    println!("{}", show.describe());
+    Ok(())
+}
+
+/// Every directory in `packs` with a manifest, sorted.
+fn available_scenes(packs: &Path) -> Result<Vec<String>> {
+    let entries = std::fs::read_dir(packs).map_err(|e| format!("{}: {e} (run tools/pack.py)", packs.display()))?;
+    let mut scenes: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().join("manifest.json").is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    scenes.sort();
+    if scenes.is_empty() {
+        return Err(format!("no scene packs in {} (run tools/pack.py)", packs.display()).into());
+    }
+    Ok(scenes)
 }
 
 /// Block until any descriptor is readable or `timeout` passes (None: no timeout).
@@ -367,22 +657,13 @@ fn merge(rects: &[Rect], max: usize) -> Vec<Rect> {
         .collect()
 }
 
-/// A random image of the layer, or with `--sky N` the sky layer's still whose game file is N.png.
-fn choose(name: &str, sources: &[String], sky: Option<u32>, rng: &mut Rng) -> Result<usize> {
-    if let (Some(n), "sky") = (sky, name) {
-        let file = format!("{n}.png");
-        return sources
-            .iter()
-            .position(|s| s.rsplit('/').next() == Some(file.as_str()))
-            .ok_or_else(|| format!("--sky {n}: not in this scene's pool").into());
-    }
-    Ok(rng.below(sources.len()))
-}
-
-fn parse_args() -> Result<Args> {
+fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut args = Args {
-        scene: "cg_firefly".into(),
         packs: "rip/packs".into(),
+        scenes: None,
+        scene: None,
+        autoplay: Some(Duration::from_secs(60)),
+        persist_skybox: false,
         palette: "neutral-lift".into(),
         fit: Fit::Cover,
         output: Target::Auto,
@@ -395,12 +676,30 @@ fn parse_args() -> Result<Args> {
         once: false,
         stats: false,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.into_iter();
     while let Some(arg) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value\n{USAGE}"));
         match arg.as_str() {
-            "--scene" => args.scene = value()?,
             "--packs" => args.packs = value()?.into(),
+            "--scenes" => {
+                let list: Vec<String> = value()?.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+                if list.is_empty() {
+                    return Err("--scenes needs at least one scene".into());
+                }
+                args.scenes = Some(list);
+            }
+            "--scene" => args.scene = Some(value()?),
+            "--autoplay" => {
+                let raw = value()?;
+                args.autoplay = match raw.as_str() {
+                    "off" => None,
+                    _ => match raw.parse::<f64>() {
+                        Ok(secs) if secs > 0.0 => Some(Duration::from_secs_f64(secs)),
+                        _ => return Err(format!("--autoplay {raw}: expected seconds or off").into()),
+                    },
+                }
+            }
+            "--persist-skybox" => args.persist_skybox = true,
             "--palette" => args.palette = value()?,
             "--fit" => {
                 args.fit = match value()?.as_str() {

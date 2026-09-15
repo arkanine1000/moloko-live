@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -63,6 +63,15 @@ pub struct Layer {
     /// The layer's current image, canvas-sized; index 0 is transparent.
     pub pixels: Vec<u8>,
     pub animation: Option<Animation>,
+    pub choice: Option<Choice>,
+}
+
+/// A layer showing one of several images (a sky or reflection pool).
+pub struct Choice {
+    pub name: String,
+    images: Vec<PathBuf>,
+    sources: Vec<String>,
+    pub current: usize,
 }
 
 pub struct Animation {
@@ -166,8 +175,13 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
                 if choices.is_empty() || sources.len() != choices.len() {
                     return Err(format!("layer {name}: choices and sources don't match").into());
                 }
-                let image = &choices[pick(&name, &sources)?];
-                Layer { pixels: read_indexed(&dir.join(image), width, height)?, animation: None }
+                let current = pick(&name, &sources)?;
+                if current >= choices.len() {
+                    return Err(format!("layer {name}: no image {current}").into());
+                }
+                let images: Vec<PathBuf> = choices.iter().map(|c| dir.join(c)).collect();
+                let pixels = read_indexed(&images[current], width, height)?;
+                Layer { pixels, animation: None, choice: Some(Choice { name, images, sources, current }) }
             }
             LayerSpec::Timeline { name, base, steps, loop_to, wrap } => {
                 if steps.len() < 2 || loop_to.is_some_and(|l| l >= steps.len()) {
@@ -189,7 +203,7 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
                     return Err(format!("layer {name}: step without holds").into());
                 }
                 let animation = Animation { steps, loop_to, wrap: patch(wrap)?, current: 0, due: None };
-                Layer { pixels: read_indexed(&dir.join(base), width, height)?, animation: Some(animation) }
+                Layer { pixels: read_indexed(&dir.join(base), width, height)?, animation: Some(animation), choice: None }
             }
         });
     }
@@ -197,6 +211,39 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
 }
 
 impl Scene {
+    /// Move choice layer `name` by `step` images (wrapping) -> its new index, or None if the scene has no such layer.
+    /// The caller redraws the canvas.
+    pub fn step_choice(&mut self, name: &str, step: isize) -> Result<Option<usize>> {
+        let (width, height) = (self.width, self.height);
+        let Some(layer) = self.layers.iter_mut().find(|l| l.choice.as_ref().is_some_and(|c| c.name == name)) else {
+            return Ok(None);
+        };
+        let Some(choice) = layer.choice.as_mut() else { return Ok(None) };
+        let index = (choice.current as isize + step).rem_euclid(choice.images.len() as isize) as usize;
+        layer.pixels = read_indexed(&choice.images[index], width, height)?;
+        choice.current = index;
+        Ok(Some(index))
+    }
+
+    /// (layer name, image index) of every choice layer.
+    pub fn choices(&self) -> Vec<(String, usize)> {
+        self.layers.iter().filter_map(|l| l.choice.as_ref()).map(|c| (c.name.clone(), c.current)).collect()
+    }
+
+    /// The images picked from pools, e.g. "sky 20, reflection 84" (game file numbers).
+    pub fn picks(&self) -> String {
+        self.layers
+            .iter()
+            .filter_map(|l| l.choice.as_ref())
+            .filter(|c| c.images.len() > 1)
+            .map(|c| {
+                let file = Path::new(&c.sources[c.current]).file_stem().map(|s| s.to_string_lossy().into_owned());
+                format!("{} {}", c.name, file.unwrap_or_default())
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Resolve the topmost opaque index of every pixel in `rect` into `frame`: the bottom layer over the background,
     /// then each layer above over that. Branch-free selects per pixel, so the loops vectorise.
     pub fn composite(&self, frame: &mut [u8], rect: Rect) {

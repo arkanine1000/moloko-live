@@ -5,7 +5,7 @@ light on CPU, GPU and battery (palette cycling on indexed art, low internal reso
 when the desktop is hidden).
 
 **The wallpaper engine is in progress.** It plays the game's scenes with their own timings, drawing only what
-changes, and pauses when windows cover the desktop, on battery, or above `--max-temp`. Scene rotation is next.
+changes, and pauses when windows cover the desktop, on battery, or above `--max-temp`. It shuffles through the scenes on a timer and takes commands from i3 keybinds.
 
 ## Wallpaper engine
 
@@ -16,8 +16,10 @@ desktop.
 ```sh
 python tools/pack.py                          # every scene -> rip/packs/<scene>/
 cargo build --release --manifest-path engine/Cargo.toml
-engine/target/release/molokolive --scene mini_cg_run   # default palette neutral-lift
-engine/target/release/molokolive --help       # fit, output, frame cap, stats
+cargo install --path engine --root ~/.local  # -> ~/.local/bin/molokolive
+molokolive --packs "$PWD/rip/packs"            # run: shuffle, 60 s autoplay, neutral-lift
+molokolive next                                # prev, sky-next, sky-prev, pause, resume, status
+molokolive --help                              # scenes, autoplay, skyboxes, fit, output, limits
 ```
 
 ## Milk-chan demo

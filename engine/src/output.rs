@@ -166,8 +166,16 @@ impl Output {
         if self.window { "desktop window" } else { "root background" }
     }
 
-    /// Create the canvas-sized source picture, scaled onto the screen as `geometry` maps it, and its shared memory.
+    /// Create the canvas-sized source picture, scaled onto the screen as `geometry` maps it, and its shared memory,
+    /// replacing those of the previous scene.
     pub fn prepare(&mut self, canvas_width: usize, canvas_height: usize, geometry: &Geometry) -> Result<()> {
+        if let Some(old) = self.source.take() {
+            self.conn.render_free_picture(old.picture)?;
+            self.conn.free_pixmap(old.pixmap)?;
+            self.conn.shm_detach(old.segment)?;
+            // SAFETY: the mapping was created by prepare with this length, and no slice of it outlives &mut self.
+            unsafe { rustix::mm::munmap(old.memory.cast(), old.capacity)? };
+        }
         let conn = &self.conn;
         let (w, h) = (u16::try_from(canvas_width)?, u16::try_from(canvas_height)?);
         let pixmap = conn.generate_id()?;
