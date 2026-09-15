@@ -66,12 +66,24 @@ pub struct Layer {
     pub choice: Option<Choice>,
 }
 
-/// A layer showing one of several images (a sky or reflection pool).
+/// A layer showing one of several images (a sky or reflection pool), possibly drifting.
 pub struct Choice {
     pub name: String,
     images: Vec<PathBuf>,
     sources: Vec<String>,
     pub current: usize,
+    /// The current image unshifted; the layer's pixels are this at `offset`.
+    base: Vec<u8>,
+    offset: (i32, i32),
+    drift: Option<Drift>,
+}
+
+/// A repeating drift: whole native-pixel offsets, each from its time within the period on.
+pub struct Drift {
+    period: f64,
+    steps: Vec<(f64, i32, i32)>,
+    next: usize,
+    due: Option<Instant>,
 }
 
 pub struct Animation {
@@ -111,6 +123,8 @@ enum LayerSpec {
         name: String,
         choices: Vec<String>,
         sources: Vec<String>,
+        #[serde(default)]
+        drift: Option<DriftSpec>,
     },
     Timeline {
         name: String,
@@ -120,6 +134,12 @@ enum LayerSpec {
         loop_to: Option<usize>,
         wrap: Option<PatchSpec>,
     },
+}
+
+#[derive(Deserialize)]
+struct DriftSpec {
+    period: f64,
+    steps: Vec<(f64, i32, i32)>,
 }
 
 #[derive(Deserialize)]
@@ -171,7 +191,7 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
     let mut layers = Vec::new();
     for spec in manifest.layers {
         layers.push(match spec {
-            LayerSpec::Choices { name, choices, sources } => {
+            LayerSpec::Choices { name, choices, sources, drift } => {
                 if choices.is_empty() || sources.len() != choices.len() {
                     return Err(format!("layer {name}: choices and sources don't match").into());
                 }
@@ -179,9 +199,20 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
                 if current >= choices.len() {
                     return Err(format!("layer {name}: no image {current}").into());
                 }
+                let drift = match drift {
+                    Some(d) if d.period > 0.0 && !d.steps.is_empty() && d.steps.iter().all(|s| (0.0..d.period).contains(&s.0)) => {
+                        Some(Drift { period: d.period, steps: d.steps, next: 0, due: None })
+                    }
+                    Some(_) => return Err(format!("layer {name}: bad drift").into()),
+                    None => None,
+                };
                 let images: Vec<PathBuf> = choices.iter().map(|c| dir.join(c)).collect();
-                let pixels = read_indexed(&images[current], width, height)?;
-                Layer { pixels, animation: None, choice: Some(Choice { name, images, sources, current }) }
+                let base = read_indexed(&images[current], width, height)?;
+                // A drifting layer rests where its cycle ends, so the first frame already matches the drift.
+                let offset = drift.as_ref().and_then(|d| d.steps.last()).map_or((0, 0), |&(_, dx, dy)| (dx, dy));
+                let pixels = shifted(&base, width, height, offset);
+                let choice = Choice { name, images, sources, current, base, offset, drift };
+                Layer { pixels, animation: None, choice: Some(choice) }
             }
             LayerSpec::Timeline { name, base, steps, loop_to, wrap } => {
                 if steps.len() < 2 || loop_to.is_some_and(|l| l >= steps.len()) {
@@ -220,9 +251,54 @@ impl Scene {
         };
         let Some(choice) = layer.choice.as_mut() else { return Ok(None) };
         let index = (choice.current as isize + step).rem_euclid(choice.images.len() as isize) as usize;
-        layer.pixels = read_indexed(&choice.images[index], width, height)?;
+        choice.base = read_indexed(&choice.images[index], width, height)?;
+        layer.pixels = shifted(&choice.base, width, height, choice.offset);
         choice.current = index;
         Ok(Some(index))
+    }
+
+    /// Start every drift at the beginning of its cycle (the layers already rest at its end offset).
+    pub fn start_drift(&mut self, now: Instant) {
+        for drift in self.drifts() {
+            drift.next = 0;
+            drift.due = Some(now + Duration::from_secs_f64(drift.steps[0].0.max(0.001)));
+        }
+    }
+
+    /// Continue drifting after a pause: the next offset comes one step's interval from now.
+    pub fn resume_drift(&mut self, now: Instant) {
+        for drift in self.drifts() {
+            if drift.due.is_some() {
+                drift.due = Some(now + Duration::from_secs_f64(drift.gap_before(drift.next)));
+            }
+        }
+    }
+
+    /// When the next drift step is due.
+    pub fn drift_due(&self) -> Option<Instant> {
+        self.layers.iter().filter_map(|l| l.choice.as_ref()?.drift.as_ref()?.due).min()
+    }
+
+    /// Take every drift step due by `now`; whether any layer moved.
+    pub fn advance_drift(&mut self, now: Instant) -> bool {
+        let (width, height) = (self.width, self.height);
+        let mut moved = false;
+        for layer in &mut self.layers {
+            let Some(choice) = layer.choice.as_mut() else { continue };
+            let Some(drift) = choice.drift.as_mut() else { continue };
+            while let Some(offset) = drift.advance(now) {
+                if offset != choice.offset {
+                    choice.offset = offset;
+                    layer.pixels = shifted(&choice.base, width, height, offset);
+                    moved = true;
+                }
+            }
+        }
+        moved
+    }
+
+    fn drifts(&mut self) -> impl Iterator<Item = &mut Drift> {
+        self.layers.iter_mut().filter_map(|l| l.choice.as_mut()?.drift.as_mut())
     }
 
     /// (layer name, image index) of every choice layer.
@@ -303,6 +379,42 @@ impl Animation {
         }
         dirty.extend_from_slice(&patch.dirty);
     }
+}
+
+impl Drift {
+    /// Seconds from the step before `i` to step `i`.
+    fn gap_before(&self, i: usize) -> f64 {
+        let previous = (i + self.steps.len() - 1) % self.steps.len();
+        let gap = (self.steps[i].0 - self.steps[previous].0).rem_euclid(self.period);
+        if gap > 0.0 { gap } else { self.period }
+    }
+
+    /// The next offset, if its step is due by `now`.
+    fn advance(&mut self, now: Instant) -> Option<(i32, i32)> {
+        let due = self.due.filter(|&due| due <= now)?;
+        let (_, dx, dy) = self.steps[self.next];
+        self.next = (self.next + 1) % self.steps.len();
+        // Keep the rhythm from the due time, but don't replay a backlog after a stall or suspend.
+        let from = if now.saturating_duration_since(due) > Duration::from_secs(1) { now } else { due };
+        self.due = Some(from + Duration::from_secs_f64(self.gap_before(self.next)));
+        Some((dx, dy))
+    }
+}
+
+/// `base` moved by (dx, dy) native pixels; the edges repeat into the uncovered strip.
+fn shifted(base: &[u8], width: usize, height: usize, (dx, dy): (i32, i32)) -> Vec<u8> {
+    if (dx, dy) == (0, 0) {
+        return base.to_vec();
+    }
+    let mut out = vec![0; base.len()];
+    for (y, row) in out.chunks_exact_mut(width).enumerate() {
+        let sy = (y as i32 - dy).clamp(0, height as i32 - 1) as usize;
+        let source = &base[sy * width..][..width];
+        for (x, px) in row.iter_mut().enumerate() {
+            *px = source[(x as i32 - dx).clamp(0, width as i32 - 1) as usize];
+        }
+    }
+    out
 }
 
 fn hold(holds: &[f64], rng: &mut Rng, min_hold: Duration) -> Duration {

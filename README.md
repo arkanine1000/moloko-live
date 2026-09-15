@@ -5,7 +5,8 @@ light on CPU, GPU and battery (palette cycling on indexed art, low internal reso
 when the desktop is hidden).
 
 **The wallpaper engine is in progress.** It plays the game's scenes with their own timings, drawing only what
-changes, and pauses when windows cover the desktop, on battery, or above `--max-temp`. It shuffles through the scenes on a timer and takes commands from i3 keybinds.
+changes (including the skies' slow drift), and pauses when windows cover the desktop, on battery, or above
+`--max-temp`. It shuffles through the scenes on a timer and takes commands from i3 keybinds.
 
 ## Wallpaper engine
 

@@ -46,6 +46,7 @@ Options:
   --scene NAME       scene to start with (default: a random one)
   --autoplay SECS    next scene after SECS seconds of animation, or off (default 60)
   --persist-skybox   each scene keeps its last skybox instead of a random one
+  --no-drift         keep skies and reflections still (the game drifts them a pixel every 2 s)
   --sky N            start with skybox still N (its game file number)
   --palette NAME     palette LUT from the packs (default neutral-lift)
   --fit MODE         cover: fill the screen, cropping overflow (default); contain: letterbox
@@ -65,6 +66,9 @@ const TEMPERATURE_INTERVAL: Duration = Duration::from_secs(5);
 const I3_RETRY: Duration = Duration::from_secs(2);
 /// Scenes remembered for `prev`.
 const HISTORY: usize = 100;
+/// Draw limit for frames with a drift step. Their changes are thin and spread over the whole canvas, so merging them
+/// into a few strips would damage 40–90% of the screen instead of 9–31% (measured), for ~1 ms of X time once a second.
+const DRIFT_MAX_RECTS: usize = 256;
 
 struct Args {
     packs: PathBuf,
@@ -72,6 +76,7 @@ struct Args {
     scene: Option<String>,
     autoplay: Option<Duration>,
     persist_skybox: bool,
+    drift: bool,
     palette: String,
     fit: Fit,
     output: Target,
@@ -212,6 +217,8 @@ struct Show {
     visible: Option<Rect>,
     letterbox: Vec<Rect>,
     background: [u8; 4],
+    /// A full recomposite after a drift step, to compare with `frame`.
+    scratch: Vec<u8>,
 }
 
 impl Show {
@@ -254,6 +261,7 @@ impl Show {
             visible: geometry.to_output(&canvas),
             letterbox: geometry.letterbox(),
             background: scene.lut[scene.background as usize],
+            scratch: Vec::new(),
             geometry,
             frame,
             scene,
@@ -272,10 +280,42 @@ impl Show {
         output.upload(canvas, 0)
     }
 
-    fn start(&mut self, rng: &mut Rng, min_hold: Duration) {
+    fn start(&mut self, rng: &mut Rng, min_hold: Duration, drift: bool) {
         let now = Instant::now();
         for animation in self.scene.layers.iter_mut().filter_map(|l| l.animation.as_mut()) {
             animation.start(now, rng, min_hold);
+        }
+        if drift {
+            self.scene.start_drift(now);
+        }
+    }
+
+    /// Canvas areas where the layers now differ from the frame on screen, as runs of 16 px tiles. A drift step
+    /// moves a whole layer, but only pixels where it shows and differs from its neighbour change.
+    fn changed_tiles(&mut self, dirty: &mut Vec<Rect>) {
+        const TILE: usize = 16;
+        let (width, height) = (self.scene.width, self.scene.height);
+        let canvas = self.canvas();
+        self.scratch.resize(width * height, 0);
+        self.scene.composite(&mut self.scratch, canvas);
+        for y0 in (0..height).step_by(TILE) {
+            let y1 = (y0 + TILE).min(height);
+            let mut run = None;
+            for x0 in (0..width).step_by(TILE) {
+                let x1 = (x0 + TILE).min(width);
+                let changed = (y0..y1).any(|y| self.scratch[y * width + x0..y * width + x1] != self.frame[y * width + x0..y * width + x1]);
+                match (changed, run) {
+                    (true, None) => run = Some(x0),
+                    (false, Some(start)) => {
+                        dirty.push(Rect { x0: start, y0, x1: x0, y1 });
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(start) = run {
+                dirty.push(Rect { x0: start, y0, x1: width, y1 });
+            }
         }
     }
 
@@ -382,12 +422,13 @@ fn run(args: Args) -> Result<()> {
     println!("{}", stops.describe());
 
     let min_hold = Duration::from_secs_f64(1.0 / args.max_fps);
-    show.start(&mut rng, min_hold);
+    show.start(&mut rng, min_hold, args.drift);
     // Animation time on the current scene, which is what --autoplay counts.
     let (mut played, mut last_tick) = (Duration::ZERO, Instant::now());
     let (mut frames, mut rects, mut pixels, mut report) = (0u64, 0u64, 0u64, Instant::now());
     let [mut t_composite, mut t_convert, mut t_x] = [Duration::ZERO; 3];
     let (mut dirty, mut shown) = (Vec::new(), Vec::new());
+    let mut drifted = false;
     loop {
         let now = Instant::now();
         if running {
@@ -415,12 +456,17 @@ fn run(args: Args) -> Result<()> {
                     animation.advance(&mut layer.pixels, width, now, &mut rng, min_hold, &mut dirty);
                 }
             }
+            if show.scene.advance_drift(now) {
+                show.changed_tiles(&mut dirty);
+                drifted = true;
+            }
         }
         if !dirty.is_empty() {
             // Upload every changed rectangle into the source first (nothing visible yet), then scale them all onto
             // the screen at once.
             let mut offset = 0;
-            for rect in merge(&dirty, args.max_rects) {
+            let max_rects = if drifted { args.max_rects.max(DRIFT_MAX_RECTS) } else { args.max_rects };
+            for rect in merge(&dirty, max_rects) {
                 let t0 = Instant::now();
                 show.scene.composite(&mut show.frame, rect);
                 let len = rect.area() * 4;
@@ -444,6 +490,7 @@ fn run(args: Args) -> Result<()> {
             t_x += t3.elapsed();
             dirty.clear();
             shown.clear();
+            drifted = false;
             frames += 1;
             if args.stats && report.elapsed() >= Duration::from_secs(10) {
                 let secs = report.elapsed().as_secs_f64();
@@ -467,6 +514,7 @@ fn run(args: Args) -> Result<()> {
         let checking_heat = thermal.is_some() && !stops.covered && !stops.battery;
         let deadline = [
             if running { show.scene.layers.iter().filter_map(|l| l.animation.as_ref()?.due).min() } else { None },
+            if running { show.scene.drift_due() } else { None },
             args.autoplay.filter(|_| running).map(|interval| Instant::now() + interval.saturating_sub(played)),
             checking_heat.then_some(next_temperature),
             i3_retry,
@@ -583,6 +631,7 @@ fn run(args: Args) -> Result<()> {
                 for animation in show.scene.layers.iter_mut().filter_map(|l| l.animation.as_mut()) {
                     animation.resume(now, &mut rng, min_hold);
                 }
+                show.scene.resume_drift(now);
             }
         }
     }
@@ -602,7 +651,7 @@ fn change_scene(
     next.upload(output)?;
     output.paint(next.visible, &next.letterbox, next.background)?;
     output.sync()?;
-    next.start(rng, min_hold);
+    next.start(rng, min_hold, args.drift);
     *show = next;
     println!("{}", show.describe());
     Ok(())
@@ -664,6 +713,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         scene: None,
         autoplay: Some(Duration::from_secs(60)),
         persist_skybox: false,
+        drift: true,
         palette: "neutral-lift".into(),
         fit: Fit::Cover,
         output: Target::Auto,
@@ -700,6 +750,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 }
             }
             "--persist-skybox" => args.persist_skybox = true,
+            "--no-drift" => args.drift = false,
             "--palette" => args.palette = value()?,
             "--fit" => {
                 args.fit = match value()?.as_str() {

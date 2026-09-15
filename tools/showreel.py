@@ -5,8 +5,8 @@
   python tools/showreel.py cg_floor mini_cg_run --palette firefly-neutral --out rip/showreel/test.mp4
 
 Offline, from rip/packs (tools/pack.py): the engine's timeline rules (random holds per visit, loops, wrap patches,
-a shortest hold of 1/--fps), its random sky choice (seeded here), and its cover scaling with nearest sampling, which
-matches the engine on screen pixel for pixel. Each scene gets its label in the game's font. The video shows game
+a shortest hold of 1/--fps), its random sky choice (seeded here), the drift of skies and reflections (rounded to the
+nearest frame), and its cover scaling with nearest sampling, which matches the engine on screen pixel for pixel. Each scene gets its label in the game's font. The video shows game
 art, so it belongs under the gitignored rip/.
 
 Every game hold is a multiple of 0.05 s, so the default 20 fps lands each step on a frame boundary. Needs ffmpeg.
@@ -23,7 +23,7 @@ FONT = ROOT / "rip" / "raw" / "images" / "122.ttf"  # Retro Gaming, the game's d
 
 
 class Scene:
-    def __init__(self, name, palette, rng, fps):
+    def __init__(self, name, palette, rng, fps, drift_on=True):
         d = PACKS / name
         m = json.loads((d / "manifest.json").read_text())
         if palette not in m["palettes"]:
@@ -34,24 +34,45 @@ class Scene:
         for layer in m["layers"]:
             if "choices" in layer:
                 i = rng.randrange(len(layer["choices"]))
-                self.layers.append({"pixels": image(layer["choices"][i]), "anim": None})
+                base = image(layer["choices"][i])
+                drift = None
+                if cycle := (layer.get("drift") if drift_on else None):
+                    # (frame within the cycle, dx, dy); the layer rests at the offset the cycle ends on
+                    drift = {"period": round(cycle["period"] * fps),
+                             "steps": [(round(t * fps), dx, dy) for t, dx, dy in cycle["steps"]],
+                             "rest": tuple(cycle["steps"][-1][1:]), "offset": None}
+                self.layers.append({"pixels": base.copy(), "base": base, "anim": None, "drift": drift})
+                if drift:
+                    self.move(self.layers[-1], drift["rest"])
                 if len(layer["choices"]) > 1:
                     picks.append(f"{layer['name']} {Path(layer['sources'][i]).stem}")
             else:
                 steps = [(s["hold"], patch(s["patch"])) for s in layer["steps"]]
-                self.layers.append({"pixels": image(layer["base"]), "anim": {
+                self.layers.append({"pixels": image(layer["base"]), "drift": None, "anim": {
                     "steps": steps, "loop": layer["loop"], "wrap": patch(layer.get("wrap")), "current": 0, "due": None}})
         self.label = name + (f"  ({', '.join(picks)})" if picks else "")
         self.lut = np.fromfile(d / m["palettes"][palette], np.uint8).reshape(256, 4)[:, [2, 1, 0]]
         self.size = m["size"]
 
+    @staticmethod
+    def move(layer, offset):
+        """Show the layer's base image shifted by `offset` native pixels, repeating the edges (as the engine does)."""
+        dx, dy = offset
+        h, w = layer["base"].shape
+        layer["pixels"] = layer["base"][np.clip(np.arange(h) - dy, 0, h - 1)][:, np.clip(np.arange(w) - dx, 0, w - 1)]
+        layer["drift"]["offset"] = offset
+
     def ticks(self, holds):
         return max(1, round(max(self.rng.choice(holds), 1 / self.fps) * self.fps))
 
     def cycle(self):
-        """Seconds for one pass through the longest timeline, at mean holds."""
-        return max((sum(max(float(np.mean(h)), 1 / self.fps) for h, _ in L["anim"]["steps"])
-                    for L in self.layers if L["anim"]), default=0.0)
+        """Seconds for one pass through the longest timeline (at mean holds) or drift cycle."""
+        timelines = [sum(max(float(np.mean(h)), 1 / self.fps) for h, _ in L["anim"]["steps"]) for L in self.layers if L["anim"]]
+        drifts = [L["drift"]["period"] / self.fps for L in self.layers if L.get("drift")]
+        return max(timelines + drifts, default=0.0)
+
+    def moves(self):
+        return any(L["anim"] or L.get("drift") for L in self.layers)
 
     def start(self):
         for L in self.layers:
@@ -59,9 +80,15 @@ class Scene:
                 a["due"] = self.ticks(a["steps"][0][0])
 
     def advance(self, tick):
-        """Step every timeline due by `tick`; whether any pixels changed."""
+        """Step every timeline and drift due by `tick`; whether any pixels changed."""
         changed = False
         for L in self.layers:
+            if d := L.get("drift"):
+                position = tick % d["period"]
+                offset = next((tuple(s[1:]) for s in reversed(d["steps"]) if s[0] <= position), d["rest"])
+                if offset != d["offset"]:
+                    self.move(L, offset)
+                    changed = True
             a = L["anim"]
             while a and a["due"] is not None and a["due"] <= tick:
                 last = a["current"] + 1 >= len(a["steps"])
@@ -106,6 +133,7 @@ def main():
     ap.add_argument("--static-seconds", type=float, default=4)
     ap.add_argument("--seed", type=int, default=20260915, help="sky choices and holds")
     ap.add_argument("--no-labels", action="store_true")
+    ap.add_argument("--no-drift", action="store_true", help="keep skies and reflections still, like the engine's --no-drift")
     args = ap.parse_args()
 
     width, height = map(int, args.size.split("x"))
@@ -122,8 +150,8 @@ def main():
 
     total = 0.0
     for name in scenes:
-        scene = Scene(name, args.palette, rng, args.fps)
-        animated = any(L["anim"] for L in scene.layers)
+        scene = Scene(name, args.palette, rng, args.fps, drift_on=not args.no_drift)
+        animated = scene.moves()
         seconds = min(max(scene.cycle(), args.min_seconds), args.max_seconds) if animated else args.static_seconds
         xs, ys = cover_maps(scene.size, width, height)
         scene.start()

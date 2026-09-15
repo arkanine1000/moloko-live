@@ -21,8 +21,10 @@ manifest.json, version 1:
   colours                  "#rrggbb" for index 1, 2, ...
   palettes                 {name: LUT path}
   layers                   bottom to top, each either
-    {"name", "choices": [image], "sources": [game path]}
+    {"name", "choices": [image], "sources": [game path], "drift": drift (optional)}
                                    one image picked at start (a sky pool; a static image is one choice)
+  drift                    {"period": s, "steps": [[t, dx, dy], ...]}: the layer's offset in native pixels from time t of
+                           each period on, from the script's `circle`/`circle2` transforms
     {"name", "base": image, "steps": [{"hold": [s, ...], "patch": patch | null}], "loop": i | null, "wrap": patch | null}
                                    step 0 shows base; entering step i > 0 applies its patch. Each visit holds for
                                    one of the listed durations, picked at random. After the last step, "wrap"
@@ -32,7 +34,7 @@ manifest.json, version 1:
                            new pixels inside rect (the bounding box of what changed), and the changed pixels as
                            rectangles on a TILE grid, so the engine knows every dirty region in advance
 """
-import argparse, hashlib, json, re, shutil, sys
+import argparse, hashlib, json, math, re, shutil, sys
 from pathlib import Path
 
 import numpy as np
@@ -58,12 +60,13 @@ MAX_OFF_GRID = 0.05
 
 
 def sky(pool):
-    return {"image": pool, "zoom": SKY_ZOOM, "name": "sky"}
+    """`show skyN at circle: truecenter zoom 1.01`."""
+    return {"image": pool, "zoom": SKY_ZOOM, "name": "sky", "drift": "circle"}
 
 
 def reflection(pool):
     """A cg_mirror_gg pool: `show cg_mirror_ggN at circle2: truecenter zoom 1.01`, between the sky and the mirror."""
-    return {"image": pool, "zoom": SKY_ZOOM, "name": "reflection"}
+    return {"image": pool, "zoom": SKY_ZOOM, "name": "reflection", "drift": "circle2"}
 
 
 # A layer is an image name, {"image", "zoom", "name"}, or a list of animations: all but the last play once, then
@@ -178,6 +181,58 @@ def parse_atl(name, lines):
     if pool and not steps:
         return ("pool", pool)
     return ("anim", [(p, h) for p, h in steps], loop)
+
+
+def parse_transform(name):
+    """`transform NAME:` in script.rpy, a repeating block of `ease|linear D xoffset|yoffset V` lines -> {"period": s,
+    "steps": [[t, dx, dy], ...]}: the repeating cycle's whole native-pixel offsets and when each takes effect. An offset
+    changes where the tweened full-resolution offset crosses half a native pixel (Ren'Py's ease is 0.5 - cos(pi t) / 2),
+    so a tween over two native pixels steps twice. The first pass starts from rest; the cycle is the steady state after
+    it, and a layer starts at the offset the cycle ends on (the last step's)."""
+    lines = (RIP / "raw" / "script.rpy").read_text(encoding="utf-8").splitlines()
+    start = next((i for i, l in enumerate(lines) if re.match(rf"\s*transform\s+{name}\s*:\s*$", l)), None)
+    if start is None:
+        sys.exit(f"transform {name} not found in script.rpy")
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    tweens, repeat = [], False
+    for line in lines[start + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        text = line.strip()
+        if not text:
+            continue
+        if text == "repeat":
+            repeat = True
+            break
+        m = re.fullmatch(r"(ease|linear)\s+([\d.]+)\s+(x|y)offset\s+(-?[\d.]+)", text)
+        if not m:
+            sys.exit(f"transform {name}: unsupported {text!r}")
+        tweens.append((m[1], float(m[2]), m[3], float(m[4]) / PIXEL))
+    if not repeat or not tweens:
+        sys.exit(f"transform {name}: expected a repeating drift")
+
+    def run(position):
+        position, t, steps = dict(position), 0.0, []
+        native = {axis: round(v) for axis, v in position.items()}
+        for kind, duration, axis, target in tweens:
+            a, b = position[axis], target
+            if a != b:
+                lo, hi = min(a, b), max(a, b)
+                edges = [k + 0.5 for k in range(math.floor(lo) - 1, math.ceil(hi) + 1) if lo < k + 0.5 < hi]
+                for edge in sorted(edges, reverse=b < a):
+                    f = (edge - a) / (b - a)
+                    fraction = math.acos(1 - 2 * f) / math.pi if kind == "ease" else f
+                    native[axis] = round(edge + 0.5) if b > a else round(edge - 0.5)
+                    steps.append([round(t + fraction * duration, 3), native["x"], native["y"]])
+            position[axis] = b
+            t += duration
+        return t, position, steps
+
+    period, rest, _ = run({"x": 0.0, "y": 0.0})
+    _, end, steps = run(rest)
+    if end != rest or not steps:
+        sys.exit(f"transform {name}: its drift doesn't settle into a cycle after one pass")
+    return {"period": round(period, 3), "steps": steps}
 
 
 def resolve(images, spec):
@@ -296,10 +351,10 @@ def build(scene, palettes, images):
     spec = SCENES[scene]
     crop = spec.get("crop", (0, 0, *NATIVE))
     size = (crop[2] - crop[0], crop[3] - crop[1])
-    layers = [layer for s in spec["layers"] for layer in resolve(images, s)]
+    layers = [(*layer, s.get("drift") if isinstance(s, dict) else None) for s in spec["layers"] for layer in resolve(images, s)]
     source = Source(crop)
     paths = lambda kind, data: data if kind == "choices" else [p for p, _ in data[0]]
-    for _, zoom, kind, data in layers:
+    for _, zoom, kind, data, _ in layers:
         for rel in paths(kind, data):
             source(rel, zoom)
 
@@ -362,9 +417,10 @@ def build(scene, palettes, images):
         return sorted([tx0 * TILE, ty0 * TILE, min(tx1 * TILE, w), min(ty1 * TILE, h)] for ty0, (tx0, tx1), ty1 in rects)
 
     manifest_layers, firsts, largest = [], [], 0
-    for name, zoom, kind, data in layers:
+    for name, zoom, kind, data, drift in layers:
         if kind == "choices":
-            manifest_layers.append({"name": name, "choices": [save(indices(rel, zoom)) for rel in data], "sources": data})
+            manifest_layers.append({"name": name, "choices": [save(indices(rel, zoom)) for rel in data], "sources": data,
+                                    **({"drift": parse_transform(drift)} if drift else {})})
             firsts.append(indices(data[0], zoom))
             continue
         steps, loop = data
