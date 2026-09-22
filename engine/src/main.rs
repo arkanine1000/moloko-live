@@ -1,4 +1,4 @@
-//! molokolive: animated scene packs (tools/pack.py) behind the desktop.
+//! molokolive: animated scene packs (molokolive-pack) behind the desktop.
 //!
 //! Each frame only the canvas rectangles a timeline step changed are recomposited, converted through the palette
 //! LUT at native size and uploaded; the X server then scales them onto the output in one grabbed burst (see
@@ -74,7 +74,7 @@ Pausing:
   --ignore-battery          keep animating on battery
 
 Files:
-  --packs DIR               scene packs built by tools/pack.py
+  --packs DIR               scene packs built by molokolive-pack
                             (default: ~/.local/share/molokolive/packs)
 
   -h, --help                show this help
@@ -695,7 +695,7 @@ fn change_scene(
 /// Every directory in `packs` with a manifest, sorted.
 fn available_scenes(packs: &Path) -> Result<Vec<String>> {
     let entries = std::fs::read_dir(packs)
-        .map_err(|_| format!("no scene packs in {} (build them with tools/pack.py, or pass --packs)", packs.display()))?;
+        .map_err(|_| format!("no scene packs in {} (build them with molokolive-pack, or pass --packs)", packs.display()))?;
     let mut scenes: Vec<String> = entries
         .flatten()
         .filter(|e| e.path().join("manifest.json").is_file())
@@ -703,7 +703,7 @@ fn available_scenes(packs: &Path) -> Result<Vec<String>> {
         .collect();
     scenes.sort();
     if scenes.is_empty() {
-        return Err(format!("no scene packs in {} (build them with tools/pack.py, or pass --packs)", packs.display()).into());
+        return Err(format!("no scene packs in {} (build them with molokolive-pack, or pass --packs)", packs.display()).into());
     }
     Ok(scenes)
 }
@@ -838,7 +838,7 @@ fn print_scenes(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Where tools/pack.py writes packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs.
+/// Where molokolive-pack writes packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs.
 fn default_packs() -> PathBuf {
     let data = std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())

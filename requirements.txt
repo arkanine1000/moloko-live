@@ -1,3 +1,0 @@
-pillow>=10
-numpy>=2     # runtime palette remapping
-pygame-ce>=2.5  # audio only (talk sound loop + fadeout)

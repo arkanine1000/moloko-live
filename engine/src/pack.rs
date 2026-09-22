@@ -1,4 +1,4 @@
-//! Scene packs written by tools/pack.py (manifest.json, version 1), and their playback state.
+//! Scene packs written by molokolive-pack (manifest.json, version 1), and their playback state.
 
 use std::collections::HashMap;
 use std::fs;
@@ -158,10 +158,10 @@ struct PatchSpec {
 /// Load a pack with one palette. `pick(layer name, game source paths)` chooses the image of each choice layer.
 pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> Result<usize>) -> Result<Scene> {
     let path = dir.join("manifest.json");
-    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e} (run tools/pack.py)", path.display()))?;
+    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e} (run molokolive-pack)", path.display()))?;
     let manifest: Manifest = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     if manifest.version != 1 {
-        return Err(format!("{}: version {}, expected 1 (rebuild with tools/pack.py)", path.display(), manifest.version).into());
+        return Err(format!("{}: version {}, expected 1 (rebuild with molokolive-pack)", path.display(), manifest.version).into());
     }
     let [width, height] = manifest.size;
 

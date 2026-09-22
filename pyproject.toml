@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molokolive"
+version = "0.1.0"
+description = "Tools that build the scene packs the molokolive wallpaper plays"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2", "pillow>=10"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+molokolive-pack = "molokolive.pack:main"
+molokolive-recolour = "molokolive.recolour:main"
+molokolive-showreel = "molokolive.showreel:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+ignore = ["E731", "E741"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["molokolive"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -ra"

@@ -1,0 +1,4 @@
+[console_scripts]
+molokolive-pack = molokolive.pack:main
+molokolive-recolour = molokolive.recolour:main
+molokolive-showreel = molokolive.showreel:main

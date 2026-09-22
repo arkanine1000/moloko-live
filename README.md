@@ -24,7 +24,7 @@ No game files are included. You need your own copy of the game.
    ```sh
    pyenv install 3.14.6
    direnv allow
-   pip install -r requirements.txt
+   pip install -e .
    ```
 
 2. Extract the game's files into `rip/`. If Steam keeps the game somewhere else, set `GAME` to its folder:
@@ -36,7 +36,7 @@ No game files are included. You need your own copy of the game.
 3. Build the scenes. They go to `~/.local/share/molokolive/packs`:
 
    ```sh
-   python tools/pack.py
+   molokolive-pack
    ```
 
 4. Install the wallpaper and start it:
@@ -101,14 +101,14 @@ bindsym $mod+Shift+apostrophe exec --no-startup-id molokolive sky-next
 
 ## Palettes
 
-The default palette, `neutral-lift`, comes from scenes recoloured by hand: `tools/recolor_scene.py` matches each
+The default palette, `neutral-lift`, comes from scenes recoloured by hand: `molokolive-recolour` matches each
 recoloured screenshot to its scene and fits a rule for the colours, which then applies to every scene.
 
 To make your own palette:
 
 1. Paint over a 1920x1080 screenshot of a scene and save it under `rip/recolours/`.
-2. Fit the palette: `python tools/recolor_scene.py rip/recolours/mine.png:cg_dream --name mine`
-3. Rebuild the scenes with it: `python tools/pack.py --palette mine neutral-lift`
+2. Fit the palette: `molokolive-recolour rip/recolours/mine.png:cg_dream --name mine`
+3. Rebuild the scenes with it: `molokolive-pack --palette mine neutral-lift`
 4. Use it: `molokolive --palette mine`
 
 ## Tools
@@ -118,9 +118,9 @@ Each tool explains itself with `--help`.
 | Tool | What it does |
 |---|---|
 | `tools/rip.sh` | extract the game's files into `rip/` (videos are skipped) |
-| `tools/pack.py` | build the scenes the wallpaper plays |
-| `tools/recolor_scene.py` | fit a palette to recoloured scene screenshots |
-| `tools/showreel.py` | render every scene into one video, as the wallpaper would play it |
+| `molokolive-pack` | build the scenes the wallpaper plays |
+| `molokolive-recolour` | fit a palette to recoloured scene screenshots |
+| `molokolive-showreel` | render every scene into one video, as the wallpaper would play it |
 | `tools/palettes.py` | extract, swap and neutralize the palettes of PNG images |
 | `tools/recolor_palette.py` | build a palette from a recoloured Milk-chan sprite |
 | `tools/dialogue.py` | extract Milk-chan's English dialogue into `rip/dialogue/` |

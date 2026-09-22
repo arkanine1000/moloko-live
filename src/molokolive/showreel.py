@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Render scene packs into one showreel video, the way the engine plays them.
 
-  python tools/showreel.py                                   # every pack, default palette
-  python tools/showreel.py cg_floor mini_cg_run --palette firefly-neutral --out rip/showreel/test.mp4
+  molokolive-showreel                                        # every pack, default palette
+  molokolive-showreel cg_floor mini_cg_run --palette firefly-neutral --out rip/showreel/test.mp4
 
-Offline, from the scene packs (tools/pack.py): the engine's timeline rules (random holds per visit, loops, wrap
+Offline, from the scene packs (molokolive-pack): the engine's timeline rules (random holds per visit, loops, wrap
 patches, a shortest hold of 1/--fps), its random sky choice (seeded here), the drift of skies and reflections (rounded
 to the nearest frame), and its cover scaling with nearest sampling, which matches the engine on screen pixel for
 pixel. Each scene gets its label in the game's font. The video shows game art, so it belongs under the gitignored
@@ -12,14 +12,20 @@ rip/.
 
 Every game hold is a multiple of 0.05 s, so the default 20 fps lands each step on a frame boundary. Needs ffmpeg.
 """
-import argparse, json, os, random, subprocess, sys, textwrap
+import argparse
+import json
+import random
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-ROOT = Path(__file__).resolve().parent.parent
-FONT = ROOT / "rip" / "raw" / "images" / "122.ttf"  # Retro Gaming, the game's dialogue font
+from molokolive.paths import RIP, ROOT, default_packs
+
+FONT = RIP / "raw" / "images" / "122.ttf"  # Retro Gaming, the game's dialogue font
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter):
@@ -32,17 +38,12 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
         return textwrap.wrap(" ".join(text.split()), width, break_on_hyphens=False)
 
 
-def default_packs():
-    """Where molokolive looks for scene packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs."""
-    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "molokolive" / "packs"
-
-
 class Scene:
     def __init__(self, name, palette, rng, fps, drift_on=True, packs=None):
         d = (packs or default_packs()) / name
         m = json.loads((d / "manifest.json").read_text())
         if palette not in m["palettes"]:
-            sys.exit(f"{name}: no palette {palette!r} (rebuild with tools/pack.py --palette {palette})")
+            sys.exit(f"{name}: no palette {palette!r} (rebuild with molokolive-pack --palette {palette})")
         image = lambda rel: np.array(Image.open(d / rel))
         patch = lambda p: None if not p else (p["rect"], image(p["image"]))
         self.rng, self.fps, self.background, self.layers, picks = rng, fps, m["background"], [], []
@@ -137,11 +138,11 @@ def cover_maps(canvas, width, height):
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="tools/showreel.py",
+        prog="molokolive-showreel",
         description="Render the scenes into one video, played the way molokolive plays them. Needs ffmpeg.",
         epilog="""examples:
-  python tools/showreel.py                                   every scene -> rip/showreel/showreel-neutral-lift.mp4
-  python tools/showreel.py cg_floor mini_cg_run --size 960x540 --out /tmp/two-scenes.mp4""",
+  molokolive-showreel                                   every scene -> rip/showreel/showreel-neutral-lift.mp4
+  molokolive-showreel cg_floor mini_cg_run --size 960x540 --out /tmp/two-scenes.mp4""",
         formatter_class=HelpFormatter,
     )
     ap.add_argument("scenes", nargs="*", metavar="SCENE", help="scenes to include, in order (default: all)")
@@ -162,9 +163,9 @@ def main():
 
     width, height = map(int, args.size.split("x"))
     if not args.packs.is_dir():
-        sys.exit(f"no scene packs in {args.packs} (build them with tools/pack.py, or pass --packs)")
+        sys.exit(f"no scene packs in {args.packs} (build them with molokolive-pack, or pass --packs)")
     scenes = args.scenes or sorted(p.name for p in args.packs.iterdir() if (p / "manifest.json").is_file())
-    out = args.out or ROOT / "rip" / "showreel" / f"showreel-{args.palette}.mp4"
+    out = args.out or RIP / "showreel" / f"showreel-{args.palette}.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.seed)
     font = ImageFont.truetype(str(FONT), max(12, height // 42))

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build scene packs for the wallpaper engine (engine/).
 
-  python tools/pack.py                                   # every scene
-  python tools/pack.py mini_cg_run cg_floor --palette firefly-neutral
+  molokolive-pack                                        # every scene
+  molokolive-pack mini_cg_run cg_floor --palette firefly-neutral
 
 SCENES lists each scene as the layer stack rip/raw/script.rpy shows. The images themselves (plain paths,
 Animation(...), ATL blocks with choice/pause/repeat, LiveComposite) are parsed from rip/raw/art.rpy.
@@ -12,7 +12,7 @@ each run):
   manifest.json          format below
   images/<hash>.png      8-bit indexed, index 0 transparent, PLTE = game colours (viewable), deduplicated
   luts/<palette>.bin     256 x BGRA: index -> screen colour (index 0 unused). Palettes are tone lists (*.hex) or
-                         lift rules (*.json with "rule", from tools/recolor_scene.py); see tools/colour.py
+                         lift rules (*.json with "rule", from molokolive-recolour); see colour.py
   preview/<palette>.png  native canvas with the first image of every layer
 
 manifest.json, version 1:
@@ -35,22 +35,21 @@ manifest.json, version 1:
                            new pixels inside rect (the bounding box of what changed), and the changed pixels as
                            rectangles on a TILE grid, so the engine knows every dirty region in advance
 """
-import argparse, hashlib, json, math, os, re, shutil, sys, textwrap
+import argparse
+import hashlib
+import json
+import math
+import re
+import shutil
+import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from colour import load_palette
-
-ROOT = Path(__file__).resolve().parent.parent
-RIP = ROOT / "rip"
-PALETTES = ROOT / "palettes"
-
-
-def default_packs():
-    """Where molokolive looks for scene packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs."""
-    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "molokolive" / "packs"
+from molokolive.colour import load_palette
+from molokolive.paths import PALETTES, RIP, default_packs
 
 NATIVE = (960, 540)
 PIXEL = 2
@@ -402,7 +401,7 @@ def build(scene, palettes, images, packs):
             runs = set()
             if ty < th:
                 edges = np.flatnonzero(np.diff(np.concatenate([[0], tiles[ty].astype(np.int8), [0]])))
-                runs = {(int(s), int(e)) for s, e in zip(edges[::2], edges[1::2])}
+                runs = {(int(s), int(e)) for s, e in zip(edges[::2], edges[1::2], strict=True)}
             for run in [r for r in running if r not in runs]:
                 rects.append((running.pop(run), run, ty))
             for run in runs:
@@ -471,11 +470,11 @@ def build(scene, palettes, images, packs):
 def main():
     scenes = "\n".join(textwrap.wrap(", ".join(sorted(SCENES)), 100, initial_indent="  ", subsequent_indent="  "))
     ap = argparse.ArgumentParser(
-        prog="tools/pack.py",
+        prog="molokolive-pack",
         description="Build the scene packs molokolive plays, from the game files tools/rip.sh extracted.",
         epilog=f"""examples:
-  python tools/pack.py                          build every scene
-  python tools/pack.py cg_floor mini_cg_run     rebuild two scenes
+  molokolive-pack                          build every scene
+  molokolive-pack cg_floor mini_cg_run     rebuild two scenes
 
 scenes:
 {scenes}""",

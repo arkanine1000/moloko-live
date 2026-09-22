@@ -1,6 +1,6 @@
 {
   "name": "neutral-lift",
-  "description": "Lift rule fitted to hand recolours of cg_dream, cg_fall_far: lightness lifted from a per-scene black level, blue-grey hue, low chroma. Built by tools/recolor_scene.py; tools/pack.py makes the LUTs.",
+  "description": "Lift rule fitted to hand recolours of cg_dream, cg_fall_far: lightness lifted from a per-scene black level, blue-grey hue, low chroma. Built by molokolive-recolour; molokolive-pack makes the LUTs.",
   "rule": {
     "gamma": 1.11,
     "l0": 0.2626,

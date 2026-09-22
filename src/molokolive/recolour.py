@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build a lift-rule palette from hand-recoloured scene frames.
 
-  python tools/recolor_scene.py rip/recolours/dream.png:cg_dream rip/recolours/fall_far.png:cg_fall_far --name neutral-lift
+  molokolive-recolour rip/recolours/dream.png:cg_dream rip/recolours/fall_far.png:cg_fall_far --name neutral-lift
 
-Needs the scenes' packs (tools/pack.py). Recolours are derived from the game's art, so keep them under rip/.
+Needs the scenes' packs (molokolive-pack). Recolours are derived from the game's art, so keep them under rip/.
 
 1. Align: each recolour (1920x1080, the game's framing) is matched against its pack. Every combination of the CG
    layers' images and timeline frames is tried, and, for scenes over a sky, every skybox still of every pool at
@@ -22,19 +22,22 @@ Adjustments after the fit, recorded in the palette:
                            chromatic entries, weighted by use in --hue-weights, an indexed image with that palette)
   --chroma-scale K         multiply chroma
 
-Writes palettes/<name>.json. tools/pack.py turns the rule into a LUT per scene.
+Writes palettes/<name>.json. molokolive-pack turns the rule into a LUT per scene.
 """
-import argparse, itertools, json, os, re, sys, textwrap
+import argparse
+import itertools
+import json
+import re
+import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from colour import hex_to_rgb_array, lift, load_palette, read_hex_palette, rgb_to_hex, srgb_to_oklab
+from molokolive.colour import hex_to_rgb_array, lift, load_palette, read_hex_palette, rgb_to_hex, srgb_to_oklab
+from molokolive.paths import PALETTES, RIP, ROOT, default_packs
 
-ROOT = Path(__file__).resolve().parent.parent
-RIP = ROOT / "rip"
-PALETTES = ROOT / "palettes"
 SKY_COLOURS = [(13, 13, 20), (82, 38, 62), (172, 50, 50)]  # every skybox still uses exactly these
 MIN_SHARE, MIN_PX = 0.9, 20  # a pair counts for the fit only if painted consistently on enough pixels
 
@@ -47,11 +50,6 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
 
     def _split_lines(self, text, width):
         return textwrap.wrap(" ".join(text.split()), width, break_on_hyphens=False)
-
-
-def default_packs():
-    """Where molokolive looks for scene packs: $XDG_DATA_HOME/molokolive/packs, else ~/.local/share/molokolive/packs."""
-    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "molokolive" / "packs"
 
 
 def key24(rgb):
@@ -69,7 +67,7 @@ def zoom_nearest(a, z):
 def layer_images(pack, layer):
     """Every image a pack layer can show: its choices, or each frame of its timeline."""
     if "choices" in layer:
-        return [(src, np.array(Image.open(pack / c))) for src, c in zip(layer["sources"], layer["choices"])]
+        return [(src, np.array(Image.open(pack / c))) for src, c in zip(layer["sources"], layer["choices"], strict=True)]
     cur = np.array(Image.open(pack / layer["base"]))
     out = [("frame 0", cur.copy())]
     for i, step in enumerate(layer["steps"][1:], 1):
@@ -173,7 +171,7 @@ def fit(scenes):
     hue, *_ = np.linalg.lstsq(np.column_stack([np.ones(len(ph)), Lp]), ph, rcond=None)
     rule = {"gamma": round(float(gamma), 3), "l0": round(float(l0.mean()), 4),
             "chroma": [round(float(v), 4) for v in chroma], "hue": [round(float(v), 2) for v in hue]}
-    return rule, {s: round(float(v), 4) for s, v in zip(names, l0)}, G, P, sid
+    return rule, {s: round(float(v), 4) for s, v in zip(names, l0, strict=True)}, G, P, sid
 
 
 def palette_hue(hex_path, weights_image=None):
@@ -196,14 +194,14 @@ def palette_hue(hex_path, weights_image=None):
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="tools/recolor_scene.py",
-        description="Fit a palette to scene screenshots you recoloured by hand, for tools/pack.py to use.\n"
+        prog="molokolive-recolour",
+        description="Fit a palette to scene screenshots you recoloured by hand, for molokolive-pack to use.\n"
                     "(How the fit works is described at the top of this file.)",
         epilog="""example:
-  python tools/recolor_scene.py rip/recolours/dream.png:cg_dream rip/recolours/fall_far.png:cg_fall_far \\
+  molokolive-recolour rip/recolours/dream.png:cg_dream rip/recolours/fall_far.png:cg_fall_far \\
       --name neutral-lift --hue-from palettes/firefly-neutral.hex \\
       --hue-weights ~/Pictures/wallpapers/firefly-neutral.png --chroma-scale 1.25
-  python tools/pack.py --palette neutral-lift""",
+  molokolive-pack --palette neutral-lift""",
         formatter_class=HelpFormatter,
     )
     ap.add_argument("recolours", nargs="+", metavar="IMAGE:SCENE",
@@ -266,7 +264,7 @@ def main():
         "name": args.name,
         "description": "Lift rule fitted to hand recolours of " + ", ".join(sorted(maps))
                        + ": lightness lifted from a per-scene black level, blue-grey hue, low chroma. "
-                         "Built by tools/recolor_scene.py; tools/pack.py makes the LUTs.",
+                         "Built by molokolive-recolour; molokolive-pack makes the LUTs.",
         "rule": rule,
         **({"adjustments": adjustments} if adjustments else {}),
         "scenes": maps,
