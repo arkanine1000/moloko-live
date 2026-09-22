@@ -1,28 +1,28 @@
 # molokolive
 
-Animated scenes from Nikita Kryukov's *Milk outside a bag of milk outside a bag of milk* as your desktop wallpaper,
-on X11 with i3. The scenes play with the game's own timings, in a cool, desaturated palette, and the skies drift
-slowly the way they do in the game.
+Scenes from *Milk outside a bag of milk outside a bag of milk*, animated as your desktop wallpaper on X11 with i3.
+They play with the game's own timings, in a cool, desaturated palette, and the skies drift the way they do in the
+game.
 
-It is built to cost next to nothing: it draws only the pixels that change, and it pauses while windows cover the
-desktop, while the laptop runs on battery, and (if you ask) while the CPU is hot.
+It costs next to nothing. Only the pixels that change are drawn, and the animation pauses while windows cover the
+desktop, while the laptop is on battery, and, if you ask, while the CPU is hot.
 
 No game files are included. You need your own copy of the game.
 
 ## Requirements
 
-- Linux with X11, the i3 window manager, and a compositor such as picom
+- Linux with X11, i3, and a compositor such as picom
 - The game, from Steam (app 1604000)
 - Rust, to build the wallpaper
-- Python 3, for the tools that prepare the scenes
-- ffmpeg, only if you want to render a showreel video
+- Python 3.12 or newer, for the tools that prepare the scenes
+- [uv](https://docs.astral.sh/uv/), which `tools/rip.sh` uses to run unrpa
+- ffmpeg, only for showreel videos
 
 ## Quick start
 
-1. Set up Python. The repository uses direnv and pyenv:
+1. Install the tools into a virtual environment. The repository comes with a direnv setup for pyenv:
 
    ```sh
-   pyenv install 3.14.6
    direnv allow
    pip install -e .
    ```
@@ -39,7 +39,7 @@ No game files are included. You need your own copy of the game.
    molokolive-pack
    ```
 
-4. Install the wallpaper and start it:
+4. Build the wallpaper and start it:
 
    ```sh
    cargo install --path engine --root ~/.local
@@ -73,15 +73,15 @@ The ones you're most likely to want. `molokolive --help` lists them all, and `--
 | `--scenes A,B,...` | rotate through these scenes only |
 | `--skip-scenes A,B,...` | leave these scenes out; `*` matches any text here and in `--scenes`, e.g. `--skip-scenes 'mini_cg_*'` |
 | `--start-scene NAME` | start with this scene |
+| `--shuffle off` | play the scenes in order instead of shuffled |
 | `--persist-sky` | give each scene back the sky it had last time |
 | `--no-drift` | keep the skies still |
 | `--max-temp DEGREES` | also pause while the CPU is at least this hot, in °C |
 | `--palette NAME` | colour palette (default: `neutral-lift`) |
 
-`molokolive --scenes --list` shows the scenes you can use (combined with `--scenes` or `--skip-scenes`, the ones
-they pick): `cg_ceiling`, `cg_dream`, `cg_eyelash`,
-`cg_fall_close`, `cg_fall_far`, `cg_firefly`, `cg_floor`, `cg_mirror`, `cg_mirror_brush`, `cg_pills`, `mini_cg_1`,
-`mini_cg_door`, `mini_cg_eyes`, `mini_cg_momp` and `mini_cg_run`.
+`molokolive --scenes --list` shows the scenes: `cg_ceiling`, `cg_dream`, `cg_eyelash`, `cg_fall_close`,
+`cg_fall_far`, `cg_firefly`, `cg_floor`, `cg_mirror`, `cg_mirror_brush`, `cg_pills`, `mini_cg_1`, `mini_cg_door`,
+`mini_cg_eyes`, `mini_cg_momp` and `mini_cg_run`.
 
 ## i3
 
@@ -101,15 +101,14 @@ bindsym $mod+Shift+apostrophe exec --no-startup-id molokolive sky-next
 
 ## Palettes
 
-The default palette, `neutral-lift`, comes from scenes recoloured by hand: `molokolive-recolour` matches each
-recoloured screenshot to its scene and fits a rule for the colours, which then applies to every scene.
-
-To make your own palette:
+The default palette, `neutral-lift`, was fitted to scenes recoloured by hand. To make your own:
 
 1. Paint over a 1920x1080 screenshot of a scene and save it under `rip/recolours/`.
 2. Fit the palette: `molokolive-recolour rip/recolours/mine.png:cg_dream --name mine`
 3. Rebuild the scenes with it: `molokolive-pack --palette mine neutral-lift`
 4. Use it: `molokolive --palette mine`
+
+How the fit works is in [docs/palettes.md](docs/palettes.md).
 
 ## Tools
 
@@ -127,11 +126,15 @@ Each tool explains itself with `--help`.
 | Path | Contents |
 |---|---|
 | `engine/` | the wallpaper (Rust) |
-| `src/molokolive/`, `tools/` | the tools above |
-| `palettes/` | palettes: `*.hex` colour lists, `*.json` colour maps and fitted rules |
+| `src/molokolive/` | the tools (Python) |
+| `tools/` | the extraction script |
+| `palettes/` | the palettes the scenes are built with |
+| `docs/` | how it all works: [docs/README.md](docs/README.md) |
 | `rip/` | files extracted from the game, recolours and showreels; ignored by git |
 
 Nothing from the game is ever committed: extracted files stay in `rip/`, and the scene packs live in
 `~/.local/share/molokolive`.
-Commits follow scoped [Conventional Commits](https://www.conventionalcommits.org/), for example
-`feat(engine): pause on battery`.
+
+---
+
+Made for one laptop, shared in case yours wants a milk-flavoured desktop too. If it does, that's thanks enough.
