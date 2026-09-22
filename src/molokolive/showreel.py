@@ -16,36 +16,32 @@ import argparse
 import json
 import random
 import subprocess
-import sys
-import textwrap
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from molokolive.cli import HelpFormatter, ToolError, run
 from molokolive.paths import RIP, ROOT, default_packs
 
-FONT = RIP / "raw" / "images" / "122.ttf"  # Retro Gaming, the game's dialogue font
-
-
-class HelpFormatter(argparse.RawDescriptionHelpFormatter):
-    """Help at 100 columns that never breaks a word at a hyphen (palette and file names stay whole)."""
-
-    def __init__(self, prog):
-        super().__init__(prog, width=100, max_help_position=30)
-
-    def _split_lines(self, text, width):
-        return textwrap.wrap(" ".join(text.split()), width, break_on_hyphens=False)
+FONT = "raw/images/122.ttf"  # Retro Gaming, the game's dialogue font, under rip/
 
 
 class Scene:
+    """A scene pack played the engine's way: layers, timelines and drift, advanced one video frame at a time."""
+
     def __init__(self, name, palette, rng, fps, drift_on=True, packs=None):
         d = (packs or default_packs()) / name
         m = json.loads((d / "manifest.json").read_text())
         if palette not in m["palettes"]:
-            sys.exit(f"{name}: no palette {palette!r} (rebuild with molokolive-pack --palette {palette})")
-        image = lambda rel: np.array(Image.open(d / rel))
-        patch = lambda p: None if not p else (p["rect"], image(p["image"]))
+            raise ToolError(f"{name}: no palette {palette!r} (rebuild with molokolive-pack --palette {palette})")
+
+        def image(rel):
+            return np.array(Image.open(d / rel))
+
+        def patch(p):
+            return None if not p else (p["rect"], image(p["image"]))
+
         self.rng, self.fps, self.background, self.layers, picks = rng, fps, m["background"], [], []
         for layer in m["layers"]:
             if "choices" in layer:
@@ -136,7 +132,7 @@ def cover_maps(canvas, width, height):
     return xs, ys
 
 
-def main():
+def command():
     ap = argparse.ArgumentParser(
         prog="molokolive-showreel",
         description="Render the scenes into one video, played the way molokolive plays them. Needs ffmpeg.",
@@ -154,21 +150,22 @@ def main():
     ap.add_argument("--max-seconds", type=float, metavar="S", default=30,
                     help="longest time per moving scene; the default fits a full cycle of every scene (default: %(default)s)")
     ap.add_argument("--static-seconds", type=float, metavar="S", default=4, help="time for a scene that doesn't move (default: %(default)s)")
-    ap.add_argument("--seed", type=int, default=20260915, help="seed for the random skies and timings, so renders repeat (default: %(default)s)")
+    ap.add_argument("--seed", type=int, default=1, help="seed for the random skies and timings, so renders repeat (default: %(default)s)")
     ap.add_argument("--no-labels", action="store_true", help="leave out the scene names")
     ap.add_argument("--no-drift", action="store_true", help="keep the skies still")
     ap.add_argument("--packs", type=Path, metavar="DIR", default=default_packs(),
                     help="scene packs to render (default: ~/.local/share/molokolive/packs)")
+    ap.add_argument("--rip", type=Path, metavar="DIR", default=RIP, help="the extracted game files, for the font (default: rip/)")
     args = ap.parse_args()
 
     width, height = map(int, args.size.split("x"))
     if not args.packs.is_dir():
-        sys.exit(f"no scene packs in {args.packs} (build them with molokolive-pack, or pass --packs)")
+        raise ToolError(f"no scene packs in {args.packs} (build them with molokolive-pack, or pass --packs)")
     scenes = args.scenes or sorted(p.name for p in args.packs.iterdir() if (p / "manifest.json").is_file())
-    out = args.out or RIP / "showreel" / f"showreel-{args.palette}.mp4"
+    out = args.out or args.rip / "showreel" / f"showreel-{args.palette}.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.seed)
-    font = ImageFont.truetype(str(FONT), max(12, height // 42))
+    font = ImageFont.truetype(str(args.rip / FONT), max(12, height // 42))
     encoder = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
          "-r", str(args.fps), "-i", "-", "-c:v", "libx264", "-preset", "slow", "-tune", "animation", "-crf", "16",
@@ -198,8 +195,12 @@ def main():
         print(f"{scene.label:40} {seconds:5.1f} s", flush=True)
     encoder.stdin.close()
     if encoder.wait():
-        sys.exit("ffmpeg failed")
+        raise ToolError("ffmpeg failed")
     print(f"{total:.0f} s -> {out.relative_to(ROOT) if out.is_relative_to(ROOT) else out}")
+
+
+def main():
+    run(command)
 
 
 if __name__ == "__main__":

@@ -7,14 +7,14 @@ Needs the scenes' packs (molokolive-pack). Recolours are derived from the game's
 
 1. Align: each recolour (1920x1080, the game's framing) is matched against its pack. Every combination of the CG
    layers' images and timeline frames is tried, and, for scenes over a sky, every skybox still of every pool at
-   zoom 1 or 1.01 with up to +-2 native px of drift: an eyeballed recolour needn't use the scene's own pool. The
+   zoom 1 or 1.01 with up to +-2 native px of drift: a hand recolour needn't use the scene's own pool. The
    best candidate is the one where each game colour gets the most consistent painted colour.
 2. Painted map per scene: game colour -> its dominant painted colour, kept in the palette as reference.
 3. Rule, in OKLab/OKLCH, fitted over every distinct painted colour:
      lightness  L' = L0 + (1 - L0) * L^gamma
      chroma     C' = c0 + c1 * C + c2 * L' (1 - L')
      hue        h' = h0 + h1 * L'  (degrees)
-   The fit gives each recolour its own black level L0 (they were eyeballed separately) and shares the rest. The
+   The fit gives each recolour its own black level L0, since they were painted independently, and shares the rest. The
    palette then uses one black level for every scene, the lightest recolour's, for simplicity.
 
 Adjustments after the fit, recorded in the palette:
@@ -27,41 +27,19 @@ Writes palettes/<name>.json. molokolive-pack turns the rule into a LUT per scene
 import argparse
 import itertools
 import json
-import re
-import sys
-import textwrap
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
+from molokolive.cli import HelpFormatter, ToolError, run
 from molokolive.colour import hex_to_rgb_array, lift, load_palette, read_hex_palette, rgb_to_hex, srgb_to_oklab
 from molokolive.paths import PALETTES, RIP, ROOT, default_packs
+from molokolive.pixels import key24, zoom_nearest
+from molokolive.renpy import Pool, parse_images
 
 SKY_COLOURS = [(13, 13, 20), (82, 38, 62), (172, 50, 50)]  # every skybox still uses exactly these
 MIN_SHARE, MIN_PX = 0.9, 20  # a pair counts for the fit only if painted consistently on enough pixels
-
-
-class HelpFormatter(argparse.RawDescriptionHelpFormatter):
-    """Help at 100 columns that never breaks a word at a hyphen (palette and file names stay whole)."""
-
-    def __init__(self, prog):
-        super().__init__(prog, width=100, max_help_position=30)
-
-    def _split_lines(self, text, width):
-        return textwrap.wrap(" ".join(text.split()), width, break_on_hyphens=False)
-
-
-def key24(rgb):
-    rgb = np.asarray(rgb).astype(np.int64)
-    return (rgb[..., 0] << 16) | (rgb[..., 1] << 8) | rgb[..., 2]
-
-
-def zoom_nearest(a, z):
-    h, w = a.shape[:2]
-    ys = np.floor((np.arange(h) + 0.5 - h / 2) / z + h / 2).astype(int).clip(0, h - 1)
-    xs = np.floor((np.arange(w) + 0.5 - w / 2) / z + w / 2).astype(int).clip(0, w - 1)
-    return a[ys][:, xs]
 
 
 def layer_images(pack, layer):
@@ -78,15 +56,16 @@ def layer_images(pack, layer):
     return out
 
 
-def sky_stills():
-    """(pool, file, zoom) -> native index map into SKY_COLOURS, for every still of every pool."""
-    art = (RIP / "raw" / "art.rpy").read_text(encoding="utf-8")
+def sky_stills(rip):
+    """(pool, file, zoom) -> native index map into SKY_COLOURS, for every still of every sky pool in art.rpy."""
+    images = parse_images((rip / "raw" / "art.rpy").read_text(encoding="utf-8"))
     keys = key24(np.array(SKY_COLOURS))
     stills = {}
-    for pool in re.findall(r"^\s*image\s+(sky\d+)\s*:", art, re.M):
-        block = re.search(rf"image {pool}:\n(.*?)(?=\n\s*image |\Z)", art, re.S).group(1)
-        for rel in re.findall(r'"images/(skybox/\d+\.png)"', block):
-            a = np.array(Image.open(RIP / "frames" / "images" / rel).convert("RGB"))[::2, ::2]
+    for pool, image in images.items():
+        if not (pool.startswith("sky") and isinstance(image, Pool)):
+            continue
+        for rel in image.paths:
+            a = np.array(Image.open(rip / "frames" / rel).convert("RGB"))[::2, ::2]  # screenshots sit on the grid
             for z in (1.0, 1.01):
                 stills[pool, rel, z] = np.searchsorted(keys, key24(zoom_nearest(a, z) if z != 1.0 else a))
     return stills
@@ -103,19 +82,19 @@ def align(recolour, scene, stills, packs):
     if img.mode != "P":
         img = img.convert("RGB").quantize(256, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
     if img.size != (1920, 1080):
-        sys.exit(f"{recolour}: {img.size[0]}x{img.size[1]}, expected the game's 1920x1080 framing")
+        raise ToolError(f"{recolour}: {img.size[0]}x{img.size[1]}, expected the game's 1920x1080 framing")
     painted = np.array(img)[::2, ::2].astype(np.int64)
     palette = np.array(img.getpalette()[:768], np.uint8).reshape(-1, 3)
     pack = packs / scene
     manifest = json.loads((pack / "manifest.json").read_text())
     if manifest["size"] != [960, 540]:
-        sys.exit(f"{scene}: cropped scenes are not supported yet")
+        raise ToolError(f"{scene}: cropped scenes are not supported yet")
     colours = np.concatenate([[[0, 0, 0]], hex_to_rgb_array(manifest["colours"])]).astype(np.uint8)
-    cg_layers = [l for l in manifest["layers"] if l["name"] != "sky"]
+    cg_layers = [layer for layer in manifest["layers"] if layer["name"] != "sky"]
     has_sky = len(cg_layers) < len(manifest["layers"])
 
     best = None
-    for combo in itertools.product(*(layer_images(pack, l) for l in cg_layers)):
+    for combo in itertools.product(*(layer_images(pack, layer) for layer in cg_layers)):
         cg = np.zeros(painted.shape, np.uint8)
         for _, idx in combo:
             cg = np.where(idx != 0, idx, cg)
@@ -182,7 +161,7 @@ def palette_hue(hex_path, weights_image=None):
         img = Image.open(weights_image)
         used = np.array(img.getpalette()[:len(colours) * 3], np.uint8).reshape(-1, 3) if img.mode == "P" else None
         if used is None or len(used) != len(colours) or (used != colours).any():
-            sys.exit(f"{weights_image}: not an indexed image with the palette of {hex_path}")
+            raise ToolError(f"{weights_image}: not an indexed image with the palette of {hex_path}")
         weights = np.bincount(np.array(img).ravel(), minlength=len(colours))[:len(colours)].astype(float)
     lab = srgb_to_oklab(colours)
     chroma = np.hypot(lab[:, 1], lab[:, 2])
@@ -192,7 +171,7 @@ def palette_hue(hex_path, weights_image=None):
     return [round(float(h0), 2), round(float(h1), 2)]
 
 
-def main():
+def command():
     ap = argparse.ArgumentParser(
         prog="molokolive-recolour",
         description="Fit a palette to scene screenshots you recoloured by hand, for molokolive-pack to use.\n"
@@ -215,14 +194,17 @@ def main():
     ap.add_argument("--chroma-scale", type=float, metavar="K", default=1.0, help="multiply the saturation by K (default: 1)")
     ap.add_argument("--packs", type=Path, metavar="DIR", default=default_packs(),
                     help="scene packs to align against (default: ~/.local/share/molokolive/packs)")
+    ap.add_argument("--rip", type=Path, metavar="DIR", default=RIP, help="the extracted game files (default: rip/)")
+    ap.add_argument("--palettes", type=Path, metavar="DIR", default=PALETTES,
+                    help="where palettes are read from and written to (default: palettes/)")
     args = ap.parse_args()
 
-    stills = sky_stills()
+    stills = sky_stills(args.rip)
     maps, fit_pairs = {}, {}
     for spec in args.recolours:
         path, _, scene = spec.rpartition(":")
         if not path or not scene:
-            sys.exit(f"{spec}: expected RECOLOUR.png:SCENE")
+            raise ToolError(f"{spec}: expected RECOLOUR.png:SCENE")
         cg_map, sky_map = align(Path(path), scene, stills, args.packs)
         exact = {g: p for g, (p, _, _) in sky_map.items()} | {g: p for g, (p, _, _) in cg_map.items()}
         maps[scene] = {"recolour": str(Path(path)), "painted": dict(sorted(exact.items()))}
@@ -246,7 +228,7 @@ def main():
     game = hex_to_rgb_array([g for s in names for g, _ in fit_pairs[s]])
     dE = np.linalg.norm(srgb_to_oklab(lift(game, rule)) - P, axis=1)
     try:
-        base = load_palette(args.baseline, PALETTES)
+        base = load_palette(args.baseline, args.palettes)
     except LookupError:
         base = None
     print(f"rule: L' = L0 + (1-L0) L^{rule['gamma']} with L0 {rule['l0']} ({lightest}, the lightest; fitted "
@@ -259,7 +241,7 @@ def main():
             line += f"; {args.baseline} {dE_base.mean():.4f}, max {dE_base.max():.4f}"
         print(line)
 
-    out = PALETTES / f"{args.name}.json"
+    out = args.palettes / f"{args.name}.json"
     out.write_text(json.dumps({
         "name": args.name,
         "description": "Lift rule fitted to hand recolours of " + ", ".join(sorted(maps))
@@ -269,7 +251,11 @@ def main():
         **({"adjustments": adjustments} if adjustments else {}),
         "scenes": maps,
     }, indent=2) + "\n")
-    print(f"-> {out.relative_to(ROOT)}")
+    print(f"-> {out.relative_to(ROOT) if out.is_relative_to(ROOT) else out}")
+
+
+def main():
+    run(command)
 
 
 if __name__ == "__main__":
