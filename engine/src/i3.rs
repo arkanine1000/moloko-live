@@ -1,8 +1,8 @@
 //! i3 IPC: whether the desktop behind the windows can be seen, and events for when that may have changed.
 //!
-//! The desktop counts as covered when a visible workspace holds any tiled window (with `smart_gaps on`, one tiled
-//! window hides the wallpaper completely) or a fullscreen window. Floating windows leave most of it visible and don't
-//! count. One connection receives workspace/window/output events; a second one answers the tree queries.
+//! The desktop counts as covered when a visible workspace holds any tiled window or a fullscreen window. Floating
+//! windows leave most of it visible and don't count. One connection receives workspace/window/output events; a
+//! second one answers the tree queries.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -18,6 +18,10 @@ const SUBSCRIBE: u32 = 2;
 const GET_TREE: u32 = 4;
 const EVENT: u32 = 1 << 31;
 const SHUTDOWN_EVENT: u32 = EVENT | 6;
+/// Magic, payload length and message type.
+const HEADER: usize = 14;
+/// Room for one read of events.
+const READ_BUFFER: usize = 16 * 1024;
 
 pub struct I3 {
     events: UnixStream,
@@ -26,6 +30,7 @@ pub struct I3 {
 }
 
 /// What a batch of events means for the engine.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Events {
     /// Nothing that could change visibility (or nothing at all).
     None,
@@ -59,7 +64,7 @@ impl I3 {
 
     /// Read every event that has arrived.
     pub fn drain(&mut self) -> Result<Events> {
-        let mut buf = [0u8; 16 * 1024];
+        let mut buf = [0u8; READ_BUFFER];
         loop {
             match self.events.read(&mut buf) {
                 Ok(0) => return Ok(Events::Lost),
@@ -73,16 +78,16 @@ impl I3 {
             }
         }
         let mut result = Events::None;
-        while self.pending.len() >= 14 {
+        while self.pending.len() >= HEADER {
             if &self.pending[..6] != MAGIC {
                 return Err("i3 IPC: bad message header".into());
             }
             let length = u32::from_le_bytes(self.pending[6..10].try_into()?) as usize;
-            if self.pending.len() < 14 + length {
+            if self.pending.len() < HEADER + length {
                 break;
             }
             let kind = u32::from_le_bytes(self.pending[10..14].try_into()?);
-            self.pending.drain(..14 + length);
+            self.pending.drain(..HEADER + length);
             if kind == SHUTDOWN_EVENT {
                 return Ok(Events::Lost);
             }
@@ -126,7 +131,7 @@ impl I3 {
 }
 
 fn send(stream: &mut UnixStream, kind: u32, payload: &[u8]) -> Result<()> {
-    let mut message = Vec::with_capacity(14 + payload.len());
+    let mut message = Vec::with_capacity(HEADER + payload.len());
     message.extend_from_slice(MAGIC);
     message.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
     message.extend_from_slice(&kind.to_le_bytes());
@@ -136,7 +141,7 @@ fn send(stream: &mut UnixStream, kind: u32, payload: &[u8]) -> Result<()> {
 }
 
 fn read_message(stream: &mut UnixStream) -> Result<(u32, Vec<u8>)> {
-    let mut header = [0u8; 14];
+    let mut header = [0u8; HEADER];
     stream.read_exact(&mut header)?;
     if &header[..6] != MAGIC {
         return Err("i3 IPC: bad message header".into());

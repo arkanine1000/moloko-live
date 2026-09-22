@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "error-context", "help"] }
 png = "0.18"
 rustix = { version = "1", features = ["event", "fs", "mm", "net"] }
 serde = { version = "1.0.229", features = ["derive"] }

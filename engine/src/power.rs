@@ -1,6 +1,4 @@
-//! Power and heat: whether the machine runs on battery (kernel uevents say when to check), and the CPU package
-//! temperature (no events exist for it, so the engine reads it on a slow timer, and only while nothing else has
-//! stopped it).
+//! Whether the machine runs on battery. Kernel uevents say when to look again.
 
 use std::fs;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -9,6 +7,9 @@ use std::path::PathBuf;
 use rustix::net::{self, AddressFamily, RecvFlags, SocketFlags, SocketType, netlink};
 
 use crate::Result;
+
+/// Room for one batch of uevents.
+const UEVENT_BUFFER: usize = 8192;
 
 pub struct Power {
     mains: Vec<PathBuf>,
@@ -47,7 +48,7 @@ impl Power {
     /// Read every queued uevent; whether any concerned a power supply.
     pub fn drain(&self) -> bool {
         let Some(fd) = &self.uevents else { return false };
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; UEVENT_BUFFER];
         let mut power = false;
         while let Ok((n, _)) = net::recv(fd, &mut buf[..], RecvFlags::DONTWAIT) {
             if n == 0 {
@@ -70,47 +71,4 @@ fn uevent_socket() -> Result<OwnedFd> {
     )?;
     net::bind(&fd, &netlink::SocketAddrNetlink::new(0, 1))?;
     Ok(fd)
-}
-
-pub struct Thermal {
-    path: PathBuf,
-    /// Stop at or above this temperature (°C).
-    pub max: i32,
-}
-
-impl Thermal {
-    /// Resume only once the temperature is this many degrees below the maximum.
-    pub const HYSTERESIS: i32 = 5;
-
-    /// The x86_pkg_temp thermal zone, which follows the CPU package closely.
-    pub fn open(max: i32) -> Result<Thermal> {
-        let mut types = Vec::new();
-        for entry in fs::read_dir("/sys/class/thermal")?.flatten() {
-            let Ok(kind) = fs::read_to_string(entry.path().join("type")) else {
-                continue;
-            };
-            if kind.trim() == "x86_pkg_temp" {
-                return Ok(Thermal {
-                    path: entry.path().join("temp"),
-                    max,
-                });
-            }
-            types.push(kind.trim().to_string());
-        }
-        Err(format!("--max-temp: no x86_pkg_temp thermal zone (found: {})", types.join(", ")).into())
-    }
-
-    pub fn celsius(&self) -> Result<i32> {
-        let millidegrees: i32 = fs::read_to_string(&self.path)?.trim().parse()?;
-        Ok(millidegrees / 1000)
-    }
-
-    /// Whether to be stopped at `celsius`, given whether we already are.
-    pub fn too_hot(&self, celsius: i32, stopped: bool) -> bool {
-        if stopped {
-            celsius > self.max - Self::HYSTERESIS
-        } else {
-            celsius >= self.max
-        }
-    }
 }

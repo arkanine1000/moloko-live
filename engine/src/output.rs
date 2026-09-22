@@ -1,13 +1,6 @@
-//! Where frames go. Changed canvas pixels are uploaded at native size through a MIT-SHM segment into a canvas-sized
-//! source pixmap; the X server scales them onto the target with a RENDER transform and the nearest filter (on this
-//! machine glamor, so on the GPU). Two targets:
-//!
-//! - window: a screen-sized override-redirect window of type _NET_WM_WINDOW_TYPE_DESKTOP at the bottom of the
-//!   stack. Drawing into it damages exactly the changed rectangles, which a compositor recomposites. The default
-//!   whenever a compositor is running: picom reads the root pixmap only when _XROOTPMAP_ID changes, so updates
-//!   drawn into it never reach the screen.
-//! - root: a root-depth pixmap set as the root background and advertised in _XROOTPMAP_ID/ESETROOT_PMAP_ID the
-//!   way feh does it, with changed areas cleared on the root window. For X without a compositor.
+//! Where frames go. Changed canvas pixels are uploaded at native size through MIT-SHM into a canvas-sized source
+//! pixmap, and the X server scales them onto the target with a RENDER transform (nearest filter). The target is a
+//! desktop window under a compositor, or the root background pixmap without one; docs/rendering.md explains why.
 
 use std::os::fd::AsFd;
 use std::ptr;
@@ -26,12 +19,13 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::Result;
-use crate::pack::Rect;
-use crate::render::Geometry;
+use crate::geometry::{Geometry, Rect};
 
 const CLASS: &[u8] = b"molokolive\0molokolive\0";
+/// The RENDER version asked for; picture transforms need 0.6.
+const RENDER_VERSION: (u32, u32) = (0, 11);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     /// window if a compositor owns _NET_WM_CM_S<screen>, else root
     Auto,
@@ -97,7 +91,7 @@ impl Output {
             return Err("MIT-SHM 1.2 (fd passing) is required".into());
         }
         let rendering = conn
-            .render_query_version(0, 11)?
+            .render_query_version(RENDER_VERSION.0, RENDER_VERSION.1)?
             .reply()
             .map_err(|e| format!("RENDER unavailable: {e}"))?;
         if (rendering.major_version, rendering.minor_version) < (0, 6) {
@@ -316,7 +310,7 @@ impl Output {
     }
 
     /// Scale the source onto screen rectangle `r` and make it visible.
-    pub fn show(&self, r: Rect) -> Result<()> {
+    fn show(&self, r: Rect) -> Result<()> {
         let (x, y) = (i16::try_from(r.x0)?, i16::try_from(r.y0)?);
         let (w, h) = (u16::try_from(r.width())?, u16::try_from(r.height())?);
         self.conn.render_composite(
@@ -346,7 +340,7 @@ impl Output {
     }
 
     /// Fill screen rectangles with a BGRX colour.
-    pub fn fill(&self, rects: &[Rect], bgrx: [u8; 4]) -> Result<()> {
+    fn fill(&self, rects: &[Rect], bgrx: [u8; 4]) -> Result<()> {
         if rects.is_empty() {
             return Ok(());
         }
