@@ -121,36 +121,14 @@ Each tool explains itself with `--help`.
 | `molokolive-pack` | build the scenes the wallpaper plays |
 | `molokolive-recolour` | fit a palette to recoloured scene screenshots |
 | `molokolive-showreel` | render every scene into one video, as the wallpaper would play it |
-| `tools/palettes.py` | extract, swap and neutralize the palettes of PNG images |
-| `tools/recolor_palette.py` | build a palette from a recoloured Milk-chan sprite |
-| `tools/dialogue.py` | extract Milk-chan's English dialogue into `rip/dialogue/` |
-
-## Milk-chan demo
-
-`apps/milkchan.py` is a playground for trying out Milk-chan outside the game. It is not part of the wallpaper. It
-rebuilds her from the game's own sprite definitions and behaves closely enough to the game to compare against:
-
-- poses, emotions and moods, blinking, and stepping through frames
-- the game's text box: font, typewriter speed, mouth movement and the talking sound
-- the palettes from `palettes/`
-- a reactive mode that comments on the artist mpd is playing, from `apps/milkchan_reactive.json`; the same artist
-  doesn't trigger a comment twice in a row
-
-```sh
-python tools/dialogue.py                  # once, for the demo's dialogue
-python apps/milkchan.py                   # window; the keys are listed in its title bar
-python apps/milkchan.py --list            # every sprite
-python apps/milkchan.py --render out.png --pose arms_down --emotion smile --mood 2
-```
 
 ## Repository
 
 | Path | Contents |
 |---|---|
 | `engine/` | the wallpaper (Rust) |
-| `tools/` | the tools above |
+| `src/molokolive/`, `tools/` | the tools above |
 | `palettes/` | palettes: `*.hex` colour lists, `*.json` colour maps and fitted rules |
-| `apps/` | the Milk-chan demo and its data |
 | `rip/` | files extracted from the game, recolours and showreels; ignored by git |
 
 Nothing from the game is ever committed: extracted files stay in `rip/`, and the scene packs live in

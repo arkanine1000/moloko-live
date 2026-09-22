@@ -1,11 +1,27 @@
-# Copyrighted game assets extracted from the Steam install — never commit.
+# Everything derived from the game stays out of the repository: the files rip.sh extracts, hand recolours,
+# extracted dialogue and rendered showreels. Scene packs are built outside the tree, in ~/.local/share/molokolive.
 rip/
+
+# The Milk-chan demo and the tools and palettes that only it used. Kept on disk, not in the repository.
+/apps/
+/tools/dialogue.py
+/tools/recolor_palette.py
+/tools/palettes.py
+/palettes/*
+!/palettes/neutral-lift.json
+!/palettes/firefly-neutral.hex
 
 # Python
 __pycache__/
 *.pyc
 .venv/
 .direnv/
+.python-version
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/
 
 # Rust
 engine/target/
