@@ -11,8 +11,8 @@ Writes <packs>/<scene>/ (default packs: ~/.local/share/molokolive/packs, outside
 each run):
   manifest.json          format below
   images/<hash>.png      8-bit indexed, index 0 transparent, PLTE = game colours (viewable), deduplicated
-  luts/<palette>.bin     256 x BGRA: index -> screen colour (index 0 unused). Palettes are tone lists (*.hex), colour
-                         maps (*.json with "map") or lift rules (*.json with "rule", from tools/recolor_scene.py)
+  luts/<palette>.bin     256 x BGRA: index -> screen colour (index 0 unused). Palettes are tone lists (*.hex) or
+                         lift rules (*.json with "rule", from tools/recolor_scene.py); see tools/colour.py
   preview/<palette>.png  native canvas with the first image of every layer
 
 manifest.json, version 1:
@@ -41,11 +41,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "apps"))
-import milkchan as mc  # noqa: E402  (tone mapping and palette loading)
+from colour import load_palette
 
+ROOT = Path(__file__).resolve().parent.parent
 RIP = ROOT / "rip"
+PALETTES = ROOT / "palettes"
 
 
 def default_packs():
@@ -338,30 +338,6 @@ class Source:
         return self.cache[rel, zoom]
 
 
-# ---------------------------------------------------------------- palettes
-
-def lift_palette(name):
-    """palettes/<name>.json if it is a lift-rule palette (tools/recolor_scene.py), else None."""
-    path = ROOT / "palettes" / f"{name}.json"
-    if not path.is_file():
-        return None
-    data = json.loads(path.read_text())
-    return data if "rule" in data else None
-
-
-def lift_colours(colours, palette):
-    """(n, 3) uint8 game colours -> (n, 3) uint8 under the palette's lift rule, the same for every scene."""
-    rule = palette["rule"]
-    lab = mc.srgb_to_oklab(np.asarray(colours, float).reshape(-1, 3))
-    L, C = np.clip(lab[:, 0], 0, 1), np.hypot(lab[:, 1], lab[:, 2])
-    l0 = rule["l0"]
-    Lp = l0 + (1 - l0) * L ** rule["gamma"]
-    c0, c1, c2 = rule["chroma"]
-    Cp = np.clip(c0 + c1 * C + c2 * Lp * (1 - Lp), 0, None)
-    h = np.radians(rule["hue"][0] + rule["hue"][1] * Lp)
-    return mc.oklab_to_srgb(np.column_stack([Lp, Cp * np.cos(h), Cp * np.sin(h)]))
-
-
 # ---------------------------------------------------------------- pack
 
 def build(scene, palettes, images, packs):
@@ -467,17 +443,13 @@ def build(scene, palettes, images, packs):
     composite = np.full(size[::-1], background, np.uint8)
     for idx in firsts:
         composite = np.where(idx != 0, idx, composite)
-    available = mc.load_palettes()
     lut_paths = {}
     for name in palettes:
-        if rule := lift_palette(name):
-            mapped = lift_colours(colours, rule)
-        elif name in available:
-            pal = available[name]
-            mapped = colours if pal is None else pal.map(colours)
-        else:
-            sys.exit(f"unknown palette {name!r}; known: {', '.join(available)}")
-        file = name.replace(" ", "-")
+        try:
+            mapped = load_palette(name, PALETTES).map(colours)
+        except LookupError as e:
+            sys.exit(str(e))
+        file = name
         lut = np.zeros((256, 4), np.uint8)
         lut[1:len(mapped) + 1] = np.column_stack([mapped[:, 2], mapped[:, 1], mapped[:, 0], np.full(len(mapped), 255)])
         (out / "luts" / f"{file}.bin").write_bytes(lut.tobytes())
@@ -510,7 +482,7 @@ scenes:
         formatter_class=HelpFormatter,
     )
     ap.add_argument("scenes", nargs="*", metavar="SCENE", help="scenes to build (default: all)")
-    palettes = ["firefly-neutral", "neutral-lift", "milkchan-neutral", "none"]
+    palettes = ["neutral-lift", "firefly-neutral", "none"]
     ap.add_argument("--palette", nargs="+", metavar="NAME", default=palettes,
                     help=f"palettes to include, from palettes/ (default: {' '.join(palettes)})")
     ap.add_argument("--packs", type=Path, metavar="DIR", default=default_packs(),

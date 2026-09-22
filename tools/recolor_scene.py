@@ -30,11 +30,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "apps"))
-import milkchan as mc  # noqa: E402  (OKLab helpers, tone-mapped palettes for the baseline)
+from colour import hex_to_rgb_array, lift, load_palette, read_hex_palette, rgb_to_hex, srgb_to_oklab
 
+ROOT = Path(__file__).resolve().parent.parent
 RIP = ROOT / "rip"
+PALETTES = ROOT / "palettes"
 SKY_COLOURS = [(13, 13, 20), (82, 38, 62), (172, 50, 50)]  # every skybox still uses exactly these
 MIN_SHARE, MIN_PX = 0.9, 20  # a pair counts for the fit only if painted consistently on enough pixels
 
@@ -57,10 +57,6 @@ def default_packs():
 def key24(rgb):
     rgb = np.asarray(rgb).astype(np.int64)
     return (rgb[..., 0] << 16) | (rgb[..., 1] << 8) | rgb[..., 2]
-
-
-def hexc(rgb):
-    return "#" + bytes(int(v) for v in rgb).hex()
 
 
 def zoom_nearest(a, z):
@@ -116,7 +112,7 @@ def align(recolour, scene, stills, packs):
     manifest = json.loads((pack / "manifest.json").read_text())
     if manifest["size"] != [960, 540]:
         sys.exit(f"{scene}: cropped scenes are not supported yet")
-    colours = np.array([[0, 0, 0]] + [[int(c[i:i + 2], 16) for i in (1, 3, 5)] for c in manifest["colours"]], np.uint8)
+    colours = np.concatenate([[[0, 0, 0]], hex_to_rgb_array(manifest["colours"])]).astype(np.uint8)
     cg_layers = [l for l in manifest["layers"] if l["name"] != "sky"]
     has_sky = len(cg_layers) < len(manifest["layers"])
 
@@ -131,7 +127,7 @@ def align(recolour, scene, stills, packs):
         if best is None or purity > best[0]:
             best = (purity, [name for name, _ in combo], cg, counts)
     purity, frames, cg, counts = best
-    cg_map = {hexc(colours[s]): (hexc(palette[p]), share, px) for s, (p, share, px) in dominant(counts).items()}
+    cg_map = {rgb_to_hex(colours[s]): (rgb_to_hex(palette[p]), share, px) for s, (p, share, px) in dominant(counts).items()}
     print(f"{recolour.name} -> {scene}: {', '.join(frames)}; CG purity {purity:.1%}")
 
     sky_map = {}
@@ -146,7 +142,7 @@ def align(recolour, scene, stills, packs):
                 if best is None or p > best[0]:
                     best = (p, pool, rel, z, dx, dy, c)
         p, pool, rel, z, dx, dy, c = best
-        sky_map = {hexc(SKY_COLOURS[s]): (hexc(palette[q]), share, px) for s, (q, share, px) in dominant(c).items()}
+        sky_map = {rgb_to_hex(SKY_COLOURS[s]): (rgb_to_hex(palette[q]), share, px) for s, (q, share, px) in dominant(c).items()}
         print(f"  sky: {rel} ({pool}) zoom {z} drift ({dx},{dy}); purity {p:.1%}")
     return cg_map, sky_map
 
@@ -156,8 +152,8 @@ def fit(scenes):
     names = sorted(scenes)
     rows = [(names.index(s), g, p) for s in names for g, p in scenes[s]]
     sid = np.array([r[0] for r in rows])
-    G = mc.srgb_to_oklab(np.array([[int(r[1][i:i + 2], 16) for i in (1, 3, 5)] for r in rows], float))
-    P = mc.srgb_to_oklab(np.array([[int(r[2][i:i + 2], 16) for i in (1, 3, 5)] for r in rows], float))
+    G = srgb_to_oklab(hex_to_rgb_array([r[1] for r in rows]))
+    P = srgb_to_oklab(hex_to_rgb_array([r[2] for r in rows]))
     gL, gC = np.clip(G[:, 0], 0, 1), np.hypot(G[:, 1], G[:, 2])
     pL, pC = P[:, 0], np.hypot(P[:, 1], P[:, 2])
     ph = np.degrees(np.arctan2(P[:, 2], P[:, 1])) % 360
@@ -180,20 +176,9 @@ def fit(scenes):
     return rule, {s: round(float(v), 4) for s, v in zip(names, l0)}, G, P, sid
 
 
-def apply_rule(rgb, rule, l0):
-    """(n, 3) uint8 game colours -> (n, 3) uint8 under the lift rule."""
-    lab = mc.srgb_to_oklab(np.asarray(rgb, float).reshape(-1, 3))
-    L, C = np.clip(lab[:, 0], 0, 1), np.hypot(lab[:, 1], lab[:, 2])
-    Lp = l0 + (1 - l0) * L ** rule["gamma"]
-    c0, c1, c2 = rule["chroma"]
-    Cp = np.clip(c0 + c1 * C + c2 * Lp * (1 - Lp), 0, None)
-    h = np.radians(rule["hue"][0] + rule["hue"][1] * Lp)
-    return mc.oklab_to_srgb(np.column_stack([Lp, Cp * np.cos(h), Cp * np.sin(h)]))
-
-
 def palette_hue(hex_path, weights_image=None):
     """Hue curve [h0, h1] (degrees, h = h0 + h1 * L) of a tone palette's chromatic entries."""
-    colours = np.array([[int(c[i:i + 2], 16) for i in (0, 2, 4)] for c in Path(hex_path).read_text().split()], np.uint8)
+    colours = read_hex_palette(Path(hex_path))
     weights = np.ones(len(colours))
     if weights_image:
         img = Image.open(weights_image)
@@ -201,7 +186,7 @@ def palette_hue(hex_path, weights_image=None):
         if used is None or len(used) != len(colours) or (used != colours).any():
             sys.exit(f"{weights_image}: not an indexed image with the palette of {hex_path}")
         weights = np.bincount(np.array(img).ravel(), minlength=len(colours))[:len(colours)].astype(float)
-    lab = mc.srgb_to_oklab(colours.astype(float))
+    lab = srgb_to_oklab(colours)
     chroma = np.hypot(lab[:, 1], lab[:, 2])
     hue = np.degrees(np.arctan2(lab[:, 2], lab[:, 1])) % 360
     keep = (chroma > 0.01) & (weights > 0)  # near-greys have no meaningful hue
@@ -260,20 +245,23 @@ def main():
     for scene in maps:
         maps[scene] = {"fitted_l0": l0[scene], **maps[scene]}
     names = sorted(fit_pairs)
-    game = np.array([[int(g[i:i + 2], 16) for i in (1, 3, 5)] for s in names for g, _ in fit_pairs[s]], np.uint8)
-    dE = np.linalg.norm(mc.srgb_to_oklab(apply_rule(game, rule, rule["l0"]).astype(float)) - P, axis=1)
-    base = mc.load_palettes().get(args.baseline)
+    game = hex_to_rgb_array([g for s in names for g, _ in fit_pairs[s]])
+    dE = np.linalg.norm(srgb_to_oklab(lift(game, rule)) - P, axis=1)
+    try:
+        base = load_palette(args.baseline, PALETTES)
+    except LookupError:
+        base = None
     print(f"rule: L' = L0 + (1-L0) L^{rule['gamma']} with L0 {rule['l0']} ({lightest}, the lightest; fitted "
           f"{', '.join(f'{s} {v}' for s, v in l0.items())}); "
           f"C' = {rule['chroma'][0]} + {rule['chroma'][1]} C + {rule['chroma'][2]} L'(1-L'); h' = {rule['hue'][0]} + {rule['hue'][1]} L'")
     for i, s in enumerate(names):
         line = f"  {s}: rule vs painted mean dE {dE[sid == i].mean():.4f}, max {dE[sid == i].max():.4f}"
         if base is not None:
-            dE_base = np.linalg.norm(mc.srgb_to_oklab(base.map(game[sid == i]).astype(float)) - P[sid == i], axis=1)
+            dE_base = np.linalg.norm(srgb_to_oklab(base.map(game[sid == i])) - P[sid == i], axis=1)
             line += f"; {args.baseline} {dE_base.mean():.4f}, max {dE_base.max():.4f}"
         print(line)
 
-    out = ROOT / "palettes" / f"{args.name}.json"
+    out = PALETTES / f"{args.name}.json"
     out.write_text(json.dumps({
         "name": args.name,
         "description": "Lift rule fitted to hand recolours of " + ", ".join(sorted(maps))
