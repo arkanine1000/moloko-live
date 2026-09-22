@@ -161,14 +161,23 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
     let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e} (run molokolive-pack)", path.display()))?;
     let manifest: Manifest = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     if manifest.version != 1 {
-        return Err(format!("{}: version {}, expected 1 (rebuild with molokolive-pack)", path.display(), manifest.version).into());
+        return Err(format!(
+            "{}: version {}, expected 1 (rebuild with molokolive-pack)",
+            path.display(),
+            manifest.version
+        )
+        .into());
     }
     let [width, height] = manifest.size;
 
     let lut_file = manifest.palettes.get(palette).ok_or_else(|| {
         let mut names: Vec<&str> = manifest.palettes.keys().map(String::as_str).collect();
         names.sort();
-        format!("no palette {palette:?} in {} (available: {})", dir.display(), names.join(", "))
+        format!(
+            "no palette {palette:?} in {} (available: {})",
+            dir.display(),
+            names.join(", ")
+        )
     })?;
     let bytes = fs::read(dir.join(lut_file))?;
     let mut lut = [[0u8; 4]; 256];
@@ -186,12 +195,22 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
         }
         Ok(Rect { x0, y0, x1, y1 })
     };
-    let canvas = Rect { x0: 0, y0: 0, x1: width, y1: height };
+    let canvas = Rect {
+        x0: 0,
+        y0: 0,
+        x1: width,
+        y1: height,
+    };
 
     let mut layers = Vec::new();
     for spec in manifest.layers {
         layers.push(match spec {
-            LayerSpec::Choices { name, choices, sources, drift } => {
+            LayerSpec::Choices {
+                name,
+                choices,
+                sources,
+                drift,
+            } => {
                 if choices.is_empty() || sources.len() != choices.len() {
                     return Err(format!("layer {name}: choices and sources don't match").into());
                 }
@@ -200,8 +219,17 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
                     return Err(format!("layer {name}: no image {current}").into());
                 }
                 let drift = match drift {
-                    Some(d) if d.period > 0.0 && !d.steps.is_empty() && d.steps.iter().all(|s| (0.0..d.period).contains(&s.0)) => {
-                        Some(Drift { period: d.period, steps: d.steps, next: 0, due: None })
+                    Some(d)
+                        if d.period > 0.0
+                            && !d.steps.is_empty()
+                            && d.steps.iter().all(|s| (0.0..d.period).contains(&s.0)) =>
+                    {
+                        Some(Drift {
+                            period: d.period,
+                            steps: d.steps,
+                            next: 0,
+                            due: None,
+                        })
                     }
                     Some(_) => return Err(format!("layer {name}: bad drift").into()),
                     None => None,
@@ -209,12 +237,33 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
                 let images: Vec<PathBuf> = choices.iter().map(|c| dir.join(c)).collect();
                 let base = read_indexed(&images[current], width, height)?;
                 // A drifting layer rests where its cycle ends, so the first frame already matches the drift.
-                let offset = drift.as_ref().and_then(|d| d.steps.last()).map_or((0, 0), |&(_, dx, dy)| (dx, dy));
+                let offset = drift
+                    .as_ref()
+                    .and_then(|d| d.steps.last())
+                    .map_or((0, 0), |&(_, dx, dy)| (dx, dy));
                 let pixels = shifted(&base, width, height, offset);
-                let choice = Choice { name, images, sources, current, base, offset, drift };
-                Layer { pixels, animation: None, choice: Some(choice) }
+                let choice = Choice {
+                    name,
+                    images,
+                    sources,
+                    current,
+                    base,
+                    offset,
+                    drift,
+                };
+                Layer {
+                    pixels,
+                    animation: None,
+                    choice: Some(choice),
+                }
             }
-            LayerSpec::Timeline { name, base, steps, loop_to, wrap } => {
+            LayerSpec::Timeline {
+                name,
+                base,
+                steps,
+                loop_to,
+                wrap,
+            } => {
                 if steps.len() < 2 || loop_to.is_some_and(|l| l >= steps.len()) {
                     return Err(format!("layer {name}: bad timeline").into());
                 }
@@ -222,23 +271,52 @@ pub fn load(dir: &Path, palette: &str, pick: &mut dyn FnMut(&str, &[String]) -> 
                     let Some(p) = p else { return Ok(None) };
                     let bounds = rect(p.rect, canvas, &p.image)?;
                     // Tile-aligned, so they may reach past the patch's exact bounds, never past the canvas.
-                    let dirty = p.dirty.iter().map(|&d| rect(d, canvas, &p.image)).collect::<Result<Vec<_>>>()?;
+                    let dirty = p
+                        .dirty
+                        .iter()
+                        .map(|&d| rect(d, canvas, &p.image))
+                        .collect::<Result<Vec<_>>>()?;
                     let pixels = read_indexed(&dir.join(&p.image), bounds.width(), bounds.height())?;
-                    Ok(Some(Patch { rect: bounds, pixels, dirty }))
+                    Ok(Some(Patch {
+                        rect: bounds,
+                        pixels,
+                        dirty,
+                    }))
                 };
                 let steps = steps
                     .into_iter()
-                    .map(|s| Ok(Step { holds: s.hold, patch: patch(s.patch)? }))
+                    .map(|s| {
+                        Ok(Step {
+                            holds: s.hold,
+                            patch: patch(s.patch)?,
+                        })
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 if steps.iter().any(|s| s.holds.is_empty()) {
                     return Err(format!("layer {name}: step without holds").into());
                 }
-                let animation = Animation { steps, loop_to, wrap: patch(wrap)?, current: 0, due: None };
-                Layer { pixels: read_indexed(&dir.join(base), width, height)?, animation: Some(animation), choice: None }
+                let animation = Animation {
+                    steps,
+                    loop_to,
+                    wrap: patch(wrap)?,
+                    current: 0,
+                    due: None,
+                };
+                Layer {
+                    pixels: read_indexed(&dir.join(base), width, height)?,
+                    animation: Some(animation),
+                    choice: None,
+                }
             }
         });
     }
-    Ok(Scene { width, height, background: manifest.background, lut, layers })
+    Ok(Scene {
+        width,
+        height,
+        background: manifest.background,
+        lut,
+        layers,
+    })
 }
 
 impl Scene {
@@ -246,10 +324,16 @@ impl Scene {
     /// The caller redraws the canvas.
     pub fn step_choice(&mut self, name: &str, step: isize) -> Result<Option<usize>> {
         let (width, height) = (self.width, self.height);
-        let Some(layer) = self.layers.iter_mut().find(|l| l.choice.as_ref().is_some_and(|c| c.name == name)) else {
+        let Some(layer) = self
+            .layers
+            .iter_mut()
+            .find(|l| l.choice.as_ref().is_some_and(|c| c.name == name))
+        else {
             return Ok(None);
         };
-        let Some(choice) = layer.choice.as_mut() else { return Ok(None) };
+        let Some(choice) = layer.choice.as_mut() else {
+            return Ok(None);
+        };
         let index = (choice.current as isize + step).rem_euclid(choice.images.len() as isize) as usize;
         choice.base = read_indexed(&choice.images[index], width, height)?;
         layer.pixels = shifted(&choice.base, width, height, choice.offset);
@@ -276,7 +360,10 @@ impl Scene {
 
     /// When the next drift step is due.
     pub fn drift_due(&self) -> Option<Instant> {
-        self.layers.iter().filter_map(|l| l.choice.as_ref()?.drift.as_ref()?.due).min()
+        self.layers
+            .iter()
+            .filter_map(|l| l.choice.as_ref()?.drift.as_ref()?.due)
+            .min()
     }
 
     /// Take every drift step due by `now`; whether any layer moved.
@@ -303,7 +390,11 @@ impl Scene {
 
     /// (layer name, image index) of every choice layer.
     pub fn choices(&self) -> Vec<(String, usize)> {
-        self.layers.iter().filter_map(|l| l.choice.as_ref()).map(|c| (c.name.clone(), c.current)).collect()
+        self.layers
+            .iter()
+            .filter_map(|l| l.choice.as_ref())
+            .map(|c| (c.name.clone(), c.current))
+            .collect()
     }
 
     /// The images picked from pools, e.g. "sky 20, reflection 84" (game file numbers).
@@ -313,7 +404,9 @@ impl Scene {
             .filter_map(|l| l.choice.as_ref())
             .filter(|c| c.images.len() > 1)
             .map(|c| {
-                let file = Path::new(&c.sources[c.current]).file_stem().map(|s| s.to_string_lossy().into_owned());
+                let file = Path::new(&c.sources[c.current])
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned());
                 format!("{} {}", c.name, file.unwrap_or_default())
             })
             .collect::<Vec<_>>()
@@ -356,7 +449,15 @@ impl Animation {
     }
 
     /// Enter the next step: patch `pixels` (canvas `width` wide) and add the changed rectangles to `dirty`.
-    pub fn advance(&mut self, pixels: &mut [u8], width: usize, now: Instant, rng: &mut Rng, min_hold: Duration, dirty: &mut Vec<Rect>) {
+    pub fn advance(
+        &mut self,
+        pixels: &mut [u8],
+        width: usize,
+        now: Instant,
+        rng: &mut Rng,
+        min_hold: Duration,
+        dirty: &mut Vec<Rect>,
+    ) {
         let Some(due) = self.due else { return };
         let (next, patch) = if self.current + 1 < self.steps.len() {
             (self.current + 1, self.steps[self.current + 1].patch.as_ref())
@@ -368,7 +469,11 @@ impl Animation {
         };
         self.current = next;
         // Keep the rhythm from the due time, but don't replay a backlog after a stall or suspend.
-        let from = if now.saturating_duration_since(due) > Duration::from_secs(1) { now } else { due };
+        let from = if now.saturating_duration_since(due) > Duration::from_secs(1) {
+            now
+        } else {
+            due
+        };
         self.due = Some(from + hold(&self.steps[next].holds, rng, min_hold));
 
         let Some(patch) = patch else { return };
@@ -395,7 +500,11 @@ impl Drift {
         let (_, dx, dy) = self.steps[self.next];
         self.next = (self.next + 1) % self.steps.len();
         // Keep the rhythm from the due time, but don't replay a backlog after a stall or suspend.
-        let from = if now.saturating_duration_since(due) > Duration::from_secs(1) { now } else { due };
+        let from = if now.saturating_duration_since(due) > Duration::from_secs(1) {
+            now
+        } else {
+            due
+        };
         self.due = Some(from + Duration::from_secs_f64(self.gap_before(self.next)));
         Some((dx, dy))
     }

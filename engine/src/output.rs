@@ -71,7 +71,11 @@ impl Output {
         let screen = &setup.roots[screen_num];
         let (root, depth) = (screen.root, screen.root_depth);
         let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
-        let bits_per_pixel = setup.pixmap_formats.iter().find(|f| f.depth == depth).map(|f| f.bits_per_pixel);
+        let bits_per_pixel = setup
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == depth)
+            .map(|f| f.bits_per_pixel);
         let masks = screen
             .allowed_depths
             .iter()
@@ -85,11 +89,17 @@ impl Output {
         {
             return Err("root visual is not 24-bit BGRX with 32 bpp, the only format supported".into());
         }
-        let shm = conn.shm_query_version()?.reply().map_err(|e| format!("MIT-SHM unavailable: {e}"))?;
+        let shm = conn
+            .shm_query_version()?
+            .reply()
+            .map_err(|e| format!("MIT-SHM unavailable: {e}"))?;
         if (shm.major_version, shm.minor_version) < (1, 2) {
             return Err("MIT-SHM 1.2 (fd passing) is required".into());
         }
-        let rendering = conn.render_query_version(0, 11)?.reply().map_err(|e| format!("RENDER unavailable: {e}"))?;
+        let rendering = conn
+            .render_query_version(0, 11)?
+            .reply()
+            .map_err(|e| format!("RENDER unavailable: {e}"))?;
         if (rendering.major_version, rendering.minor_version) < (0, 6) {
             return Err("RENDER 0.6 (picture transforms) is required".into());
         }
@@ -108,7 +118,10 @@ impl Output {
             Target::Root => false,
             Target::Window => true,
             Target::Auto => {
-                let cm = conn.intern_atom(false, format!("_NET_WM_CM_S{screen_num}").as_bytes())?.reply()?.atom;
+                let cm = conn
+                    .intern_atom(false, format!("_NET_WM_CM_S{screen_num}").as_bytes())?
+                    .reply()?
+                    .atom;
                 conn.get_selection_owner(cm)?.reply()?.owner != x11rb::NONE
             }
         };
@@ -118,20 +131,40 @@ impl Output {
                 .override_redirect(1)
                 .background_pixmap(x11rb::NONE)
                 .event_mask(EventMask::EXPOSURE);
-            conn.create_window(0, drawable, root, 0, 0, width, height, 0, WindowClass::INPUT_OUTPUT, 0, &attributes)?
-                .check()?;
+            conn.create_window(
+                0,
+                drawable,
+                root,
+                0,
+                0,
+                width,
+                height,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &attributes,
+            )?
+            .check()?;
             let atom = |name: &[u8]| -> Result<u32> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
             let (wm_type, desktop) = (atom(b"_NET_WM_WINDOW_TYPE")?, atom(b"_NET_WM_WINDOW_TYPE_DESKTOP")?);
             conn.change_property32(PropMode::REPLACE, drawable, wm_type, AtomEnum::ATOM, &[desktop])?;
             conn.change_property8(PropMode::REPLACE, drawable, AtomEnum::WM_CLASS, AtomEnum::STRING, CLASS)?;
-            conn.change_property8(PropMode::REPLACE, drawable, AtomEnum::WM_NAME, AtomEnum::STRING, b"molokolive")?;
+            conn.change_property8(
+                PropMode::REPLACE,
+                drawable,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                b"molokolive",
+            )?;
         } else {
             conn.create_pixmap(depth, drawable, root, width, height)?.check()?;
         }
         let target = conn.generate_id()?;
-        conn.render_create_picture(target, drawable, format, &CreatePictureAux::new())?.check()?;
+        conn.render_create_picture(target, drawable, format, &CreatePictureAux::new())?
+            .check()?;
         let gc = conn.generate_id()?;
-        conn.create_gc(gc, root, &CreateGCAux::new().graphics_exposures(0))?.check()?;
+        conn.create_gc(gc, root, &CreateGCAux::new().graphics_exposures(0))?
+            .check()?;
         Ok(Output {
             conn,
             root,
@@ -153,7 +186,12 @@ impl Output {
         if atom == x11rb::NONE {
             return None;
         }
-        let reply = self.conn.get_property(false, self.root, atom, AtomEnum::ANY, 0, 1024).ok()?.reply().ok()?;
+        let reply = self
+            .conn
+            .get_property(false, self.root, atom, AtomEnum::ANY, 0, 1024)
+            .ok()?
+            .reply()
+            .ok()?;
         String::from_utf8(reply.value).ok().filter(|p| !p.is_empty())
     }
 
@@ -163,7 +201,11 @@ impl Output {
     }
 
     pub fn kind(&self) -> &'static str {
-        if self.window { "desktop window" } else { "root background" }
+        if self.window {
+            "desktop window"
+        } else {
+            "root background"
+        }
     }
 
     /// Create the canvas-sized source picture, scaled onto the screen as `geometry` maps it, and its shared memory,
@@ -181,7 +223,8 @@ impl Output {
         let pixmap = conn.generate_id()?;
         conn.create_pixmap(self.depth, pixmap, self.root, w, h)?.check()?;
         let picture = conn.generate_id()?;
-        conn.render_create_picture(picture, pixmap, self.format, &CreatePictureAux::new())?.check()?;
+        conn.render_create_picture(picture, pixmap, self.format, &CreatePictureAux::new())?
+            .check()?;
         // Screen -> canvas: (x - offset) / scale. RENDER samples each destination pixel at its centre, matching
         // Geometry's maps.
         let fixed = |v: f64| (v * 65536.0).round() as render::Fixed;
@@ -206,11 +249,24 @@ impl Output {
         // SAFETY: a fresh shared mapping of a memfd we sized; it stays mapped for the life of the process, and only
         // this Output hands out slices of it.
         let memory = unsafe {
-            rustix::mm::mmap(ptr::null_mut(), capacity, ProtFlags::READ | ProtFlags::WRITE, MapFlags::SHARED, &fd, 0)?
+            rustix::mm::mmap(
+                ptr::null_mut(),
+                capacity,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED,
+                &fd,
+                0,
+            )?
         } as *mut u8;
         let segment = conn.generate_id()?;
         conn.shm_attach_fd(segment, fd, true)?.check()?;
-        self.source = Some(Source { pixmap, picture, segment, memory, capacity });
+        self.source = Some(Source {
+            pixmap,
+            picture,
+            segment,
+            memory,
+            capacity,
+        });
         Ok(())
     }
 
@@ -239,7 +295,23 @@ impl Output {
         let (x, y) = (i16::try_from(r.x0)?, i16::try_from(r.y0)?);
         let format = ImageFormat::Z_PIXMAP.into();
         let offset = u32::try_from(offset)?;
-        self.conn.shm_put_image(source.pixmap, self.gc, w, h, 0, 0, w, h, x, y, self.depth, format, false, source.segment, offset)?;
+        self.conn.shm_put_image(
+            source.pixmap,
+            self.gc,
+            w,
+            h,
+            0,
+            0,
+            w,
+            h,
+            x,
+            y,
+            self.depth,
+            format,
+            false,
+            source.segment,
+            offset,
+        )?;
         Ok(())
     }
 
@@ -247,7 +319,20 @@ impl Output {
     pub fn show(&self, r: Rect) -> Result<()> {
         let (x, y) = (i16::try_from(r.x0)?, i16::try_from(r.y0)?);
         let (w, h) = (u16::try_from(r.width())?, u16::try_from(r.height())?);
-        self.conn.render_composite(PictOp::SRC, self.source().picture, x11rb::NONE, self.target, x, y, 0, 0, x, y, w, h)?;
+        self.conn.render_composite(
+            PictOp::SRC,
+            self.source().picture,
+            x11rb::NONE,
+            self.target,
+            x,
+            y,
+            0,
+            0,
+            x,
+            y,
+            w,
+            h,
+        )?;
         self.expose_root(r)
     }
 
@@ -266,12 +351,25 @@ impl Output {
             return Ok(());
         }
         let channel = |v: u8| u16::from(v) * 257;
-        let color = render::Color { red: channel(bgrx[2]), green: channel(bgrx[1]), blue: channel(bgrx[0]), alpha: 0xffff };
+        let color = render::Color {
+            red: channel(bgrx[2]),
+            green: channel(bgrx[1]),
+            blue: channel(bgrx[0]),
+            alpha: 0xffff,
+        };
         let rectangles = rects
             .iter()
-            .map(|r| Ok(Rectangle { x: i16::try_from(r.x0)?, y: i16::try_from(r.y0)?, width: u16::try_from(r.width())?, height: u16::try_from(r.height())? }))
+            .map(|r| {
+                Ok(Rectangle {
+                    x: i16::try_from(r.x0)?,
+                    y: i16::try_from(r.y0)?,
+                    width: u16::try_from(r.width())?,
+                    height: u16::try_from(r.height())?,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
-        self.conn.render_fill_rectangles(PictOp::SRC, self.target, color, &rectangles)?;
+        self.conn
+            .render_fill_rectangles(PictOp::SRC, self.target, color, &rectangles)?;
         rects.iter().try_for_each(|&r| self.expose_root(r))
     }
 
@@ -279,7 +377,14 @@ impl Output {
     fn expose_root(&self, r: Rect) -> Result<()> {
         if !self.window {
             let (x, y) = (i16::try_from(r.x0)?, i16::try_from(r.y0)?);
-            self.conn.clear_area(false, self.root, x, y, u16::try_from(r.width())?, u16::try_from(r.height())?)?;
+            self.conn.clear_area(
+                false,
+                self.root,
+                x,
+                y,
+                u16::try_from(r.width())?,
+                u16::try_from(r.height())?,
+            )?;
         }
         Ok(())
     }
@@ -296,27 +401,55 @@ impl Output {
     pub fn publish(&self, visible: Option<Rect>, letterbox: &[Rect], background: [u8; 4]) -> Result<()> {
         let atom = |name: &[u8]| -> Result<u32> { Ok(self.conn.intern_atom(false, name)?.reply()?.atom) };
         let instance = atom(b"_MOLOKOLIVE_WINDOW")?;
-        let previous = self.conn.get_property(false, self.root, instance, AtomEnum::WINDOW, 0, 1)?.reply()?;
-        let previous = previous.value32().and_then(|mut v| v.next()).filter(|&w| w != self.drawable && self.is_ours(w));
+        let previous = self
+            .conn
+            .get_property(false, self.root, instance, AtomEnum::WINDOW, 0, 1)?
+            .reply()?;
+        let previous = previous
+            .value32()
+            .and_then(|mut v| v.next())
+            .filter(|&w| w != self.drawable && self.is_ours(w));
 
         if self.window {
             self.conn.map_window(self.drawable)?;
-            self.conn.configure_window(self.drawable, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
+            self.conn
+                .configure_window(self.drawable, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
             self.sync()?;
             self.paint(visible, letterbox, background)?;
-            self.conn.change_property32(PropMode::REPLACE, self.root, instance, AtomEnum::WINDOW, &[self.drawable])?;
+            self.conn.change_property32(
+                PropMode::REPLACE,
+                self.root,
+                instance,
+                AtomEnum::WINDOW,
+                &[self.drawable],
+            )?;
         } else {
             self.paint(visible, letterbox, background)?;
             let (xrootpmap, esetroot) = (atom(b"_XROOTPMAP_ID")?, atom(b"ESETROOT_PMAP_ID")?);
-            let old = self.conn.get_property(false, self.root, esetroot, AtomEnum::PIXMAP, 0, 1)?.reply()?;
+            let old = self
+                .conn
+                .get_property(false, self.root, esetroot, AtomEnum::PIXMAP, 0, 1)?
+                .reply()?;
             if let Some(id) = old.value32().and_then(|mut v| v.next()) {
                 self.conn.kill_client(id)?.ignore_error();
             }
             let attributes = ChangeWindowAttributesAux::new().background_pixmap(self.drawable);
             self.conn.change_window_attributes(self.root, &attributes)?.check()?;
             self.conn.clear_area(false, self.root, 0, 0, 0, 0)?;
-            self.conn.change_property32(PropMode::REPLACE, self.root, xrootpmap, AtomEnum::PIXMAP, &[self.drawable])?;
-            self.conn.change_property32(PropMode::REPLACE, self.root, esetroot, AtomEnum::PIXMAP, &[self.drawable])?;
+            self.conn.change_property32(
+                PropMode::REPLACE,
+                self.root,
+                xrootpmap,
+                AtomEnum::PIXMAP,
+                &[self.drawable],
+            )?;
+            self.conn.change_property32(
+                PropMode::REPLACE,
+                self.root,
+                esetroot,
+                AtomEnum::PIXMAP,
+                &[self.drawable],
+            )?;
             self.conn.delete_property(self.root, instance)?;
             self.conn.set_close_down_mode(CloseDown::RETAIN_PERMANENT)?.check()?;
         }
@@ -328,7 +461,10 @@ impl Output {
 
     /// Whether `window` still exists and is a molokolive window; its id may since belong to another client.
     fn is_ours(&self, window: u32) -> bool {
-        let Ok(cookie) = self.conn.get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 16) else {
+        let Ok(cookie) = self
+            .conn
+            .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 16)
+        else {
             return false;
         };
         cookie.reply().is_ok_and(|r| r.value == CLASS)
@@ -353,7 +489,12 @@ impl Output {
                         x1: usize::from(e.x) + usize::from(e.width),
                         y1: usize::from(e.y) + usize::from(e.height),
                     };
-                    exposed.extend(r.intersect(&Rect { x0: 0, y0: 0, x1: self.width, y1: self.height }));
+                    exposed.extend(r.intersect(&Rect {
+                        x0: 0,
+                        y0: 0,
+                        x1: self.width,
+                        y1: self.height,
+                    }));
                 }
                 _ => {}
             }

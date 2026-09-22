@@ -31,9 +31,14 @@ impl Geometry {
     pub fn new(canvas_width: usize, canvas_height: usize, width: usize, height: usize, fit: Fit) -> Geometry {
         let (sx, sy) = (width as f64 / canvas_width as f64, height as f64 / canvas_height as f64);
         let scale = if fit == Fit::Cover { sx.max(sy) } else { sx.min(sy) };
-        let offset = ((width as f64 - canvas_width as f64 * scale) / 2.0, (height as f64 - canvas_height as f64 * scale) / 2.0);
+        let offset = (
+            (width as f64 - canvas_width as f64 * scale) / 2.0,
+            (height as f64 - canvas_height as f64 * scale) / 2.0,
+        );
         let axis = |out: usize, offset: f64| -> Vec<i32> {
-            (0..out).map(|o| ((o as f64 + 0.5 - offset) / scale).floor() as i32).collect()
+            (0..out)
+                .map(|o| ((o as f64 + 0.5 - offset) / scale).floor() as i32)
+                .collect()
         };
         Geometry {
             width,
@@ -42,17 +47,32 @@ impl Geometry {
             offset,
             xmap: axis(width, offset.0),
             ymap: axis(height, offset.1),
-            canvas: Rect { x0: 0, y0: 0, x1: canvas_width, y1: canvas_height },
+            canvas: Rect {
+                x0: 0,
+                y0: 0,
+                x1: canvas_width,
+                y1: canvas_height,
+            },
         }
     }
 
     pub fn screen(&self) -> Rect {
-        Rect { x0: 0, y0: 0, x1: self.width, y1: self.height }
+        Rect {
+            x0: 0,
+            y0: 0,
+            x1: self.width,
+            y1: self.height,
+        }
     }
 
     /// The screen pixels whose source lies in the canvas rectangle, or None if all of them are off screen.
     pub fn to_output(&self, r: &Rect) -> Option<Rect> {
-        let span = |map: &[i32], a: usize, b: usize| (map.partition_point(|&v| v < a as i32), map.partition_point(|&v| v < b as i32));
+        let span = |map: &[i32], a: usize, b: usize| {
+            (
+                map.partition_point(|&v| v < a as i32),
+                map.partition_point(|&v| v < b as i32),
+            )
+        };
         let ((x0, x1), (y0, y1)) = (span(&self.xmap, r.x0, r.x1), span(&self.ymap, r.y0, r.y1));
         (x0 < x1 && y0 < y1).then_some(Rect { x0, y0, x1, y1 })
     }
@@ -60,12 +80,34 @@ impl Geometry {
     /// Screen areas outside the canvas (contain mode), to fill with the background.
     pub fn letterbox(&self) -> Vec<Rect> {
         let s = self.screen();
-        let Some(c) = self.to_output(&self.canvas) else { return vec![s] };
+        let Some(c) = self.to_output(&self.canvas) else {
+            return vec![s];
+        };
         let bands = [
-            Rect { x0: 0, y0: 0, x1: s.x1, y1: c.y0 },
-            Rect { x0: 0, y0: c.y1, x1: s.x1, y1: s.y1 },
-            Rect { x0: 0, y0: c.y0, x1: c.x0, y1: c.y1 },
-            Rect { x0: c.x1, y0: c.y0, x1: s.x1, y1: c.y1 },
+            Rect {
+                x0: 0,
+                y0: 0,
+                x1: s.x1,
+                y1: c.y0,
+            },
+            Rect {
+                x0: 0,
+                y0: c.y1,
+                x1: s.x1,
+                y1: s.y1,
+            },
+            Rect {
+                x0: 0,
+                y0: c.y0,
+                x1: c.x0,
+                y1: c.y1,
+            },
+            Rect {
+                x0: c.x1,
+                y0: c.y0,
+                x1: s.x1,
+                y1: c.y1,
+            },
         ];
         bands.into_iter().filter(|b| b.x0 < b.x1 && b.y0 < b.y1).collect()
     }

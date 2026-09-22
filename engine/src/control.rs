@@ -54,7 +54,10 @@ impl Server {
                 stream.set_write_timeout(Some(Duration::from_millis(200)))?;
                 let mut line = String::new();
                 BufReader::new(&stream).read_line(&mut line)?;
-                Ok(Request { command: line.trim().to_string(), stream: stream.try_clone()? })
+                Ok(Request {
+                    command: line.trim().to_string(),
+                    stream: stream.try_clone()?,
+                })
             };
             if let Ok(request) = read() {
                 requests.push(request);

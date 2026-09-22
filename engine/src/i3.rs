@@ -45,7 +45,11 @@ impl I3 {
             return Err("i3 IPC: subscribing to events failed".into());
         }
         events.set_nonblocking(true)?;
-        Ok(I3 { events, commands, pending: Vec::new() })
+        Ok(I3 {
+            events,
+            commands,
+            pending: Vec::new(),
+        })
     }
 
     /// Readable when events arrive; call `drain` then.
@@ -62,7 +66,9 @@ impl I3 {
                 Ok(n) => self.pending.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::BrokenPipe) => return Ok(Events::Lost),
+                Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::BrokenPipe) => {
+                    return Ok(Events::Lost);
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -143,7 +149,9 @@ fn read_message(stream: &mut UnixStream) -> Result<(u32, Vec<u8>)> {
 }
 
 fn children(node: &Value) -> impl Iterator<Item = &Value> {
-    ["nodes", "floating_nodes"].into_iter().flat_map(move |k| node[k].as_array().into_iter().flatten())
+    ["nodes", "floating_nodes"]
+        .into_iter()
+        .flat_map(move |k| node[k].as_array().into_iter().flatten())
 }
 
 fn find_workspaces<'a>(node: &'a Value, out: &mut Vec<&'a Value>) {
@@ -156,13 +164,18 @@ fn find_workspaces<'a>(node: &'a Value, out: &mut Vec<&'a Value>) {
 
 /// A window anywhere under the tiling tree (`nodes`), not in a floating container.
 fn has_tiled_window(node: &Value) -> bool {
-    node["nodes"].as_array().into_iter().flatten().any(|c| c["window"].is_u64() || has_tiled_window(c))
+    node["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|c| c["window"].is_u64() || has_tiled_window(c))
 }
 
 /// A fullscreen container on this workspace. Workspaces themselves always report fullscreen_mode 1, so only
 /// containers count.
 fn has_fullscreen(node: &Value) -> bool {
-    children(node).any(|c| (c["type"] == "con" && c["fullscreen_mode"].as_u64().is_some_and(|m| m > 0)) || has_fullscreen(c))
+    children(node)
+        .any(|c| (c["type"] == "con" && c["fullscreen_mode"].as_u64().is_some_and(|m| m > 0)) || has_fullscreen(c))
 }
 
 /// A container in global fullscreen (mode 2) covers every output.

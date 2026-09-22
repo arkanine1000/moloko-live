@@ -39,7 +39,8 @@ macro_rules! say {
     }};
 }
 
-const HELP: &str = "molokolive: scenes from \"Milk outside a bag of milk outside a bag of milk\", animated as your wallpaper
+const HELP: &str =
+    "molokolive: scenes from \"Milk outside a bag of milk outside a bag of milk\", animated as your wallpaper
 
 Usage:
   molokolive [OPTIONS]      start the wallpaper
@@ -156,7 +157,11 @@ impl Stops {
         if let Some(c) = self.hot {
             reasons.push(format!("too hot ({c} °C)"));
         }
-        if reasons.is_empty() { "animating".into() } else { format!("paused: {}", reasons.join(", ")) }
+        if reasons.is_empty() {
+            "animating".into()
+        } else {
+            format!("paused: {}", reasons.join(", "))
+        }
     }
 }
 
@@ -165,7 +170,9 @@ pub struct Rng(u64);
 
 impl Rng {
     fn seeded() -> Rng {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos() as u64);
         Rng(nanos | 1)
     }
 
@@ -187,7 +194,12 @@ struct Rotation {
 
 impl Rotation {
     fn new(scenes: Vec<String>, first: Option<String>, rng: &mut Rng) -> Rotation {
-        let mut rotation = Rotation { scenes, deck: Vec::new(), history: Vec::new(), position: 0 };
+        let mut rotation = Rotation {
+            scenes,
+            deck: Vec::new(),
+            history: Vec::new(),
+            position: 0,
+        };
         let first = match first {
             Some(name) => {
                 // The starting scene has shown: deal the rest of the first deck without it.
@@ -291,7 +303,12 @@ impl Show {
             skies.insert((name.to_string(), layer), index);
         }
         let geometry = Geometry::new(scene.width, scene.height, output.width, output.height, args.fit);
-        let canvas = Rect { x0: 0, y0: 0, x1: scene.width, y1: scene.height };
+        let canvas = Rect {
+            x0: 0,
+            y0: 0,
+            x1: scene.width,
+            y1: scene.height,
+        };
         let mut frame = vec![scene.background; scene.width * scene.height];
         scene.composite(&mut frame, canvas);
         Ok(Show {
@@ -307,14 +324,25 @@ impl Show {
     }
 
     fn canvas(&self) -> Rect {
-        Rect { x0: 0, y0: 0, x1: self.scene.width, y1: self.scene.height }
+        Rect {
+            x0: 0,
+            y0: 0,
+            x1: self.scene.width,
+            y1: self.scene.height,
+        }
     }
 
     /// Give the output a source picture for this scene and upload the whole canvas into it.
     fn upload(&self, output: &mut Output) -> Result<()> {
         output.prepare(self.scene.width, self.scene.height, &self.geometry)?;
         let canvas = self.canvas();
-        render::convert(&self.frame, self.scene.width, canvas, &self.scene.lut, output.image(0, canvas.area() * 4));
+        render::convert(
+            &self.frame,
+            self.scene.width,
+            canvas,
+            &self.scene.lut,
+            output.image(0, canvas.area() * 4),
+        );
         output.upload(canvas, 0)
     }
 
@@ -341,25 +369,41 @@ impl Show {
             let mut run = None;
             for x0 in (0..width).step_by(TILE) {
                 let x1 = (x0 + TILE).min(width);
-                let changed = (y0..y1).any(|y| self.scratch[y * width + x0..y * width + x1] != self.frame[y * width + x0..y * width + x1]);
+                let changed = (y0..y1).any(|y| {
+                    self.scratch[y * width + x0..y * width + x1] != self.frame[y * width + x0..y * width + x1]
+                });
                 match (changed, run) {
                     (true, None) => run = Some(x0),
                     (false, Some(start)) => {
-                        dirty.push(Rect { x0: start, y0, x1: x0, y1 });
+                        dirty.push(Rect {
+                            x0: start,
+                            y0,
+                            x1: x0,
+                            y1,
+                        });
                         run = None;
                     }
                     _ => {}
                 }
             }
             if let Some(start) = run {
-                dirty.push(Rect { x0: start, y0, x1: width, y1 });
+                dirty.push(Rect {
+                    x0: start,
+                    y0,
+                    x1: width,
+                    y1,
+                });
             }
         }
     }
 
     fn describe(&self) -> String {
         let picks = self.scene.picks();
-        if picks.is_empty() { self.name.clone() } else { format!("{} ({picks})", self.name) }
+        if picks.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} ({picks})", self.name)
+        }
     }
 }
 
@@ -371,7 +415,10 @@ fn main() -> ExitCode {
     };
     if let Some(command) = argv.first().filter(|a| !a.starts_with('-')) {
         if !control::COMMANDS.contains(&command.as_str()) {
-            return fail(format!("unknown command '{command}' (commands: {})", control::COMMANDS.join(", ")));
+            return fail(format!(
+                "unknown command '{command}' (commands: {})",
+                control::COMMANDS.join(", ")
+            ));
         }
         if argv.len() > 1 {
             return fail(format!("'{command}' doesn't take options"));
@@ -423,7 +470,10 @@ fn run(args: Args) -> Result<()> {
     let server = control::Server::bind()?;
 
     // What may stop animation, and its state now.
-    let i3_path = std::env::var("I3SOCK").ok().filter(|p| !p.is_empty()).or_else(|| output.i3_socket_path());
+    let i3_path = std::env::var("I3SOCK")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| output.i3_socket_path());
     let mut i3 = None;
     let mut i3_retry = None;
     if !args.ignore_covered {
@@ -486,7 +536,9 @@ fn run(args: Args) -> Result<()> {
             let now = Instant::now();
             let width = show.scene.width;
             for layer in &mut show.scene.layers {
-                let Some(animation) = layer.animation.as_mut() else { continue };
+                let Some(animation) = layer.animation.as_mut() else {
+                    continue;
+                };
                 while animation.due.is_some_and(|due| due <= now) {
                     animation.advance(&mut layer.pixels, width, now, &mut rng, min_hold, &mut dirty);
                 }
@@ -500,7 +552,11 @@ fn run(args: Args) -> Result<()> {
             // Upload every changed rectangle into the source first (nothing visible yet), then scale them all onto
             // the screen at once.
             let mut offset = 0;
-            let max_rects = if drifted { args.max_rects.max(DRIFT_MAX_RECTS) } else { args.max_rects };
+            let max_rects = if drifted {
+                args.max_rects.max(DRIFT_MAX_RECTS)
+            } else {
+                args.max_rects
+            };
             for rect in merge(&dirty, max_rects) {
                 let t0 = Instant::now();
                 show.scene.composite(&mut show.frame, rect);
@@ -510,7 +566,13 @@ fn run(args: Args) -> Result<()> {
                     offset = 0;
                 }
                 let t1 = Instant::now();
-                render::convert(&show.frame, show.scene.width, rect, &show.scene.lut, output.image(offset, len));
+                render::convert(
+                    &show.frame,
+                    show.scene.width,
+                    rect,
+                    &show.scene.lut,
+                    output.image(offset, len),
+                );
                 let t2 = Instant::now();
                 output.upload(rect, offset)?;
                 shown.extend(show.geometry.to_output(&rect));
@@ -548,9 +610,15 @@ fn run(args: Args) -> Result<()> {
         // while only heat could be stopping us, an i3 reconnect attempt. With none of those, block on events alone.
         let checking_heat = thermal.is_some() && !stops.covered && !stops.battery;
         let deadline = [
-            if running { show.scene.layers.iter().filter_map(|l| l.animation.as_ref()?.due).min() } else { None },
+            if running {
+                show.scene.layers.iter().filter_map(|l| l.animation.as_ref()?.due).min()
+            } else {
+                None
+            },
             if running { show.scene.drift_due() } else { None },
-            args.autoplay.filter(|_| running).map(|interval| Instant::now() + interval.saturating_sub(played)),
+            args.autoplay
+                .filter(|_| running)
+                .map(|interval| Instant::now() + interval.saturating_sub(played)),
             checking_heat.then_some(next_temperature),
             i3_retry,
         ]
@@ -558,11 +626,15 @@ fn run(args: Args) -> Result<()> {
         .flatten()
         .min();
         {
-            let fds: Vec<BorrowedFd> =
-                [Some(output.fd()), Some(server.fd()), i3.as_ref().map(|c| c.fd()), power.as_ref().and_then(Power::fd)]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+            let fds: Vec<BorrowedFd> = [
+                Some(output.fd()),
+                Some(server.fd()),
+                i3.as_ref().map(|c| c.fd()),
+                power.as_ref().and_then(Power::fd),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
             wait(&fds, deadline.map(|d| d.saturating_duration_since(Instant::now())))?;
         }
 
@@ -578,17 +650,23 @@ fn run(args: Args) -> Result<()> {
         for request in server.accept() {
             let reply = match request.command.as_str() {
                 "next" | "prev" => {
-                    let target = if request.command == "next" { Some(rotation.next(&mut rng)) } else { rotation.prev() };
+                    let target = if request.command == "next" {
+                        Some(rotation.next(&mut rng))
+                    } else {
+                        rotation.prev()
+                    };
                     match target {
                         None => format!("{} (no earlier scene)", show.describe()),
-                        Some(name) => match change_scene(&args, &name, &mut output, &mut rng, &mut skies, &mut show, min_hold) {
-                            Ok(()) => {
-                                (played, last_tick) = (Duration::ZERO, Instant::now());
-                                dirty.clear();
-                                show.describe()
+                        Some(name) => {
+                            match change_scene(&args, &name, &mut output, &mut rng, &mut skies, &mut show, min_hold) {
+                                Ok(()) => {
+                                    (played, last_tick) = (Duration::ZERO, Instant::now());
+                                    dirty.clear();
+                                    show.describe()
+                                }
+                                Err(e) => format!("error: {e}"),
                             }
-                            Err(e) => format!("error: {e}"),
-                        },
+                        }
                     }
                 }
                 "sky-next" | "sky-prev" => {
@@ -609,12 +687,18 @@ fn run(args: Args) -> Result<()> {
                 }
                 "status" => {
                     let autoplay = match args.autoplay {
-                        Some(interval) => format!("; next scene after {} s more animation", interval.saturating_sub(played).as_secs()),
+                        Some(interval) => format!(
+                            "; next scene after {} s more animation",
+                            interval.saturating_sub(played).as_secs()
+                        ),
                         None => String::new(),
                     };
                     format!("{}: {}{autoplay}", show.describe(), stops.describe())
                 }
-                other => format!("error: unknown command {other:?} (commands: {})", control::COMMANDS.join(", ")),
+                other => format!(
+                    "error: unknown command {other:?} (commands: {})",
+                    control::COMMANDS.join(", ")
+                ),
             };
             request.reply(&reply);
         }
@@ -694,8 +778,12 @@ fn change_scene(
 
 /// Every directory in `packs` with a manifest, sorted.
 fn available_scenes(packs: &Path) -> Result<Vec<String>> {
-    let entries = std::fs::read_dir(packs)
-        .map_err(|_| format!("no scene packs in {} (build them with molokolive-pack, or pass --packs)", packs.display()))?;
+    let entries = std::fs::read_dir(packs).map_err(|_| {
+        format!(
+            "no scene packs in {} (build them with molokolive-pack, or pass --packs)",
+            packs.display()
+        )
+    })?;
     let mut scenes: Vec<String> = entries
         .flatten()
         .filter(|e| e.path().join("manifest.json").is_file())
@@ -703,14 +791,21 @@ fn available_scenes(packs: &Path) -> Result<Vec<String>> {
         .collect();
     scenes.sort();
     if scenes.is_empty() {
-        return Err(format!("no scene packs in {} (build them with molokolive-pack, or pass --packs)", packs.display()).into());
+        return Err(format!(
+            "no scene packs in {} (build them with molokolive-pack, or pass --packs)",
+            packs.display()
+        )
+        .into());
     }
     Ok(scenes)
 }
 
 /// Block until any descriptor is readable or `timeout` passes (None: no timeout).
 fn wait(fds: &[BorrowedFd], timeout: Option<Duration>) -> Result<()> {
-    let timespec = timeout.map(|d| Timespec { tv_sec: d.as_secs() as _, tv_nsec: d.subsec_nanos() as _ });
+    let timespec = timeout.map(|d| Timespec {
+        tv_sec: d.as_secs() as _,
+        tv_nsec: d.subsec_nanos() as _,
+    });
     let mut polled: Vec<PollFd> = fds.iter().map(|fd| PollFd::new(fd, PollFlags::IN)).collect();
     match rustix::event::poll(&mut polled, timespec.as_ref()) {
         Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
@@ -736,8 +831,15 @@ fn merge(rects: &[Rect], max: usize) -> Vec<Rect> {
     let height = bounds.height();
     (0..max)
         .filter_map(|i| {
-            let strip = Rect { y0: bounds.y0 + height * i / max, y1: bounds.y0 + height * (i + 1) / max, ..bounds };
-            merged.iter().filter_map(|r| r.intersect(&strip)).reduce(|a, b| a.union(&b))
+            let strip = Rect {
+                y0: bounds.y0 + height * i / max,
+                y1: bounds.y0 + height * (i + 1) / max,
+                ..bounds
+            };
+            merged
+                .iter()
+                .filter_map(|r| r.intersect(&strip))
+                .reduce(|a, b| a.union(&b))
         })
         .collect()
 }
@@ -750,7 +852,9 @@ fn select_scenes(args: &Args) -> Result<Vec<String>> {
         for pattern in patterns {
             let matched: Vec<String> = available.iter().filter(|s| wildcard(pattern, s)).cloned().collect();
             if matched.is_empty() {
-                return Err(format!("{option}: no scene matches '{pattern}' (molokolive --scenes --list shows them)").into());
+                return Err(
+                    format!("{option}: no scene matches '{pattern}' (molokolive --scenes --list shows them)").into(),
+                );
             }
             found.extend(matched);
         }
@@ -802,7 +906,11 @@ fn wildcard(pattern: &str, name: &str) -> bool {
 fn print_scenes(args: &Args) -> Result<()> {
     let everything = available_scenes(&args.packs)?;
     let filtered = args.scenes.is_some() || !args.skip_scenes.is_empty();
-    let scenes = if filtered { select_scenes(args)? } else { everything.clone() };
+    let scenes = if filtered {
+        select_scenes(args)?
+    } else {
+        everything.clone()
+    };
     let packs = args.packs.as_path();
     let home = std::env::var("HOME").unwrap_or_default();
     let shown = packs.display().to_string();
@@ -811,7 +919,11 @@ fn print_scenes(args: &Args) -> Result<()> {
         _ => shown,
     };
     if filtered {
-        say!("{} of the {} scenes in {shown}, as --scenes and --skip-scenes pick them:\n", scenes.len(), everything.len());
+        say!(
+            "{} of the {} scenes in {shown}, as --scenes and --skip-scenes pick them:\n",
+            scenes.len(),
+            everything.len()
+        );
     } else {
         say!("Scenes in {shown}:\n");
     }
@@ -821,7 +933,9 @@ fn print_scenes(args: &Args) -> Result<()> {
         let manifest: serde_json::Value = serde_json::from_str(&text)?;
         let layers = manifest["layers"].as_array().cloned().unwrap_or_default();
         let pool = |layer: &str| {
-            layers.iter().any(|l| l["name"] == layer && l["choices"].as_array().is_some_and(|c| c.len() > 1))
+            layers
+                .iter()
+                .any(|l| l["name"] == layer && l["choices"].as_array().is_some_and(|c| c.len() > 1))
         };
         let mut features = Vec::new();
         if pool("sky") {
@@ -830,11 +944,18 @@ fn print_scenes(args: &Args) -> Result<()> {
         if pool("reflection") {
             features.push("reflection");
         }
-        features.push(if layers.iter().any(|l| l.get("steps").is_some()) { "animated" } else { "still" });
+        features.push(if layers.iter().any(|l| l.get("steps").is_some()) {
+            "animated"
+        } else {
+            "still"
+        });
         say!("  {name:width$}   {}", features.join(", "));
     }
-    say!("\nUse the names with --scenes, e.g. molokolive --scenes {},{}, or with --start-scene.",
-        everything[0], everything.get(1).unwrap_or(&everything[0]));
+    say!(
+        "\nUse the names with --scenes, e.g. molokolive --scenes {},{}, or with --start-scene.",
+        everything[0],
+        everything.get(1).unwrap_or(&everything[0])
+    );
     Ok(())
 }
 
@@ -890,7 +1011,10 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 _ => {}
             }
         }
-        let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value (see molokolive --help)"));
+        let mut value = || {
+            it.next()
+                .ok_or_else(|| format!("{arg} needs a value (see molokolive --help)"))
+        };
         match arg.as_str() {
             "--packs" => args.packs = value()?.into(),
             "--scenes" => {
@@ -899,14 +1023,26 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                     args.scenes = None;
                     continue;
                 }
-                let list: Vec<String> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+                let list: Vec<String> = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
                 if list.is_empty() {
-                    return Err("--scenes needs at least one scene name (molokolive --scenes --list shows them)".into());
+                    return Err(
+                        "--scenes needs at least one scene name (molokolive --scenes --list shows them)".into(),
+                    );
                 }
                 args.scenes = Some(list);
             }
             "--skip-scenes" => {
-                args.skip_scenes = value()?.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+                args.skip_scenes = value()?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
             }
             "--start-scene" => args.start_scene = Some(value()?),
             "--autoplay" => {
@@ -939,19 +1075,31 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
             }
             "--sky" => {
                 let raw = value()?;
-                args.sky = Some(raw.parse().map_err(|_| format!("--sky {raw}: expected a sky number, e.g. 12"))?);
+                args.sky = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--sky {raw}: expected a sky number, e.g. 12"))?,
+                );
             }
             "--max-fps" => {
                 let raw = value()?;
-                args.max_fps = raw.parse::<f64>().map_err(|_| format!("--max-fps {raw}: expected a number"))?.max(0.1);
+                args.max_fps = raw
+                    .parse::<f64>()
+                    .map_err(|_| format!("--max-fps {raw}: expected a number"))?
+                    .max(0.1);
             }
             "--max-rects" => {
                 let raw = value()?;
-                args.max_rects = raw.parse::<usize>().map_err(|_| format!("--max-rects {raw}: expected a whole number"))?.max(1);
+                args.max_rects = raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("--max-rects {raw}: expected a whole number"))?
+                    .max(1);
             }
             "--max-temp" => {
                 let raw = value()?;
-                args.max_temp = Some(raw.parse().map_err(|_| format!("--max-temp {raw}: expected whole degrees C, e.g. 80"))?);
+                args.max_temp = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--max-temp {raw}: expected whole degrees C, e.g. 80"))?,
+                );
             }
             "--ignore-covered" => args.ignore_covered = true,
             "--ignore-battery" => args.ignore_battery = true,

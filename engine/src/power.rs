@@ -33,7 +33,10 @@ impl Power {
     /// A mains supply exists and none of them is online. Machines without one count as on mains.
     pub fn on_battery(&self) -> bool {
         !self.mains.is_empty()
-            && !self.mains.iter().any(|p| fs::read_to_string(p.join("online")).is_ok_and(|v| v.trim() == "1"))
+            && !self
+                .mains
+                .iter()
+                .any(|p| fs::read_to_string(p.join("online")).is_ok_and(|v| v.trim() == "1"))
     }
 
     /// Readable when uevents arrive; call `drain` then.
@@ -59,7 +62,12 @@ impl Power {
 
 fn uevent_socket() -> Result<OwnedFd> {
     let flags = SocketFlags::CLOEXEC | SocketFlags::NONBLOCK;
-    let fd = net::socket_with(AddressFamily::NETLINK, SocketType::DGRAM, flags, Some(netlink::KOBJECT_UEVENT))?;
+    let fd = net::socket_with(
+        AddressFamily::NETLINK,
+        SocketType::DGRAM,
+        flags,
+        Some(netlink::KOBJECT_UEVENT),
+    )?;
     net::bind(&fd, &netlink::SocketAddrNetlink::new(0, 1))?;
     Ok(fd)
 }
@@ -78,9 +86,14 @@ impl Thermal {
     pub fn open(max: i32) -> Result<Thermal> {
         let mut types = Vec::new();
         for entry in fs::read_dir("/sys/class/thermal")?.flatten() {
-            let Ok(kind) = fs::read_to_string(entry.path().join("type")) else { continue };
+            let Ok(kind) = fs::read_to_string(entry.path().join("type")) else {
+                continue;
+            };
             if kind.trim() == "x86_pkg_temp" {
-                return Ok(Thermal { path: entry.path().join("temp"), max });
+                return Ok(Thermal {
+                    path: entry.path().join("temp"),
+                    max,
+                });
             }
             types.push(kind.trim().to_string());
         }
@@ -94,6 +107,10 @@ impl Thermal {
 
     /// Whether to be stopped at `celsius`, given whether we already are.
     pub fn too_hot(&self, celsius: i32, stopped: bool) -> bool {
-        if stopped { celsius > self.max - Self::HYSTERESIS } else { celsius >= self.max }
+        if stopped {
+            celsius > self.max - Self::HYSTERESIS
+        } else {
+            celsius >= self.max
+        }
     }
 }
