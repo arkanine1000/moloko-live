@@ -71,7 +71,7 @@ random sky.
 | `--scenes A,B,...` | rotate through these scenes only |
 | `--skip-scenes A,B,...` | leave these scenes out; `*` matches any text here and in `--scenes`, e.g. `--skip-scenes 'mini_cg_*'` |
 | `--start-scene NAME` | start with this scene |
-| `--shuffle off` | play the scenes in order instead of shuffled |
+| `--shuffle` | play the scenes in random order instead of the order the list shows |
 | `--persist-sky` | give each scene back the sky it had last time |
 | `--no-drift` | keep the skies still |
 | `--max-temp DEGREES` | also pause while the CPU is at least this hot, in °C |

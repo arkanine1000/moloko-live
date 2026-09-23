@@ -5,9 +5,9 @@ engine's socket, sends one line and prints the one-line reply.
 
 ## Order
 
-`rotation.rs` keeps the sequence. With `--shuffle on` (the default) the scenes are a shuffled deck: every scene
-shows once before the deck is dealt again, and the scene on screen is never dealt next. With `--shuffle off` the
-scenes play in the order `--scenes --list` shows, wrapping around. Either way `prev` walks back through the
+`rotation.rs` keeps the sequence. By default the scenes play in the order `--scenes --list` shows, wrapping
+around. With `--shuffle` they are a shuffled deck: every scene shows once before the deck is dealt again, and
+the scene on screen is never dealt next. Either way `prev` walks back through the
 last 100 scenes shown and `next` walks forward again before dealing new ones.
 
 `--scenes A,B,...` and `--skip-scenes A,B,...` choose the scenes, both with `*` wildcards; `--scenes --list`

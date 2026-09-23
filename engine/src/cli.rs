@@ -29,7 +29,7 @@ Scenes:
   --skip-scenes A,B,...     leave these scenes out; in both, * matches any text, e.g. 'mini_cg_*'
   --scenes --list           list the scenes you can use, or the ones --scenes and --skip-scenes pick
   --start-scene NAME        start with this scene (default: a random one)
-  --shuffle on|off          play the scenes in random order, or in the order the list shows (default: on)
+  --shuffle                 play the scenes in random order instead of the order the list shows
   --autoplay SECONDS|off    change scene after this many seconds of animation (default: 60)
   --sky N                   start with sky N (`molokolive status` shows sky numbers)
   --persist-sky             give each scene back the sky it had last time
@@ -83,7 +83,7 @@ pub struct Args {
     pub skip_scenes: Names,
     #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
     pub start_scene: Option<String>,
-    #[arg(long, value_name = "on|off", default_value = "on", action = ArgAction::Set, value_parser = on_off)]
+    #[arg(long)]
     pub shuffle: bool,
     #[arg(long, value_name = "SECONDS|off", default_value = "60", value_parser = autoplay)]
     pub autoplay: Autoplay,
@@ -228,14 +228,6 @@ fn name_list(raw: &str) -> std::result::Result<Names, String> {
     Ok(Names(names(raw)))
 }
 
-fn on_off(raw: &str) -> std::result::Result<bool, String> {
-    match raw {
-        "on" | "true" | "yes" => Ok(true),
-        "off" | "false" | "no" => Ok(false),
-        _ => Err("expected on or off".into()),
-    }
-}
-
 fn autoplay(raw: &str) -> std::result::Result<Autoplay, String> {
     if raw == "off" {
         return Ok(Autoplay(None));
@@ -290,7 +282,7 @@ mod tests {
     fn defaults() {
         let args = parse(&[]).unwrap();
         assert!(args.scenes.is_empty() && args.skip_scenes.is_empty() && args.start_scene.is_none());
-        assert!(args.shuffle && args.drift && !args.persist_sky && !args.once);
+        assert!(!args.shuffle && args.drift && !args.persist_sky && !args.once);
         assert_eq!(args.autoplay, Autoplay(Some(Duration::from_secs(60))));
         assert_eq!(
             (args.fit, args.output, args.max_fps, args.max_rects),
@@ -325,8 +317,7 @@ mod tests {
 
     #[test]
     fn shuffle_and_clamps() {
-        assert!(!parse(&["--shuffle", "off"]).unwrap().shuffle);
-        assert!(parse(&["--shuffle=yes"]).unwrap().shuffle);
+        assert!(parse(&["--shuffle"]).unwrap().shuffle);
         assert_eq!(parse(&["--max-fps", "0"]).unwrap().max_fps, 0.1);
         assert_eq!(parse(&["--max-rects", "0"]).unwrap().max_rects, 1);
     }
@@ -343,11 +334,6 @@ mod tests {
             parse(&["--scenes", ""])
                 .unwrap_err()
                 .contains("at least one scene name")
-        );
-        assert!(
-            parse(&["--shuffle", "maybe"])
-                .unwrap_err()
-                .contains("expected on or off")
         );
         assert!(parse(&["--frobnicate"]).unwrap_err().contains("--frobnicate"));
     }
