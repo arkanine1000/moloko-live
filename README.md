@@ -1,22 +1,21 @@
-# molokolive
+# moloko-live
 
-Scenes from *Milk outside a bag of milk outside a bag of milk*, animated as your desktop wallpaper on X11 with i3.
-They play with the game's own timings, in a cool, desaturated palette, and the skies drift the way they do in the
-game.
+Scenes from *Milk outside a bag of milk outside a bag of milk*, animated as your desktop wallpaper on X11.
+They play with the game's own timings, with support for custom palettes.
 
 It costs next to nothing. Only the pixels that change are drawn, and the animation pauses while windows cover the
-desktop, while the laptop is on battery, and, if you ask, while the CPU is hot.
+desktop, while on battery power, and optionally while the CPU is hot.
 
-No game files are included. You need your own copy of the game.
+*No game files are included. You need your own copy of the game.*
 
 ## Requirements
 
-- Linux with X11, i3, and a compositor such as picom
+- Linux with X11, and a compositor such as picom
 - The game, from Steam (app 1604000)
 - Rust, to build the wallpaper
 - Python 3.12 or newer, for the tools that prepare the scenes
 - [uv](https://docs.astral.sh/uv/), which `tools/rip.sh` uses to run unrpa
-- ffmpeg, only for showreel videos
+- ffmpeg (only for showreel videos)
 
 ## Quick start
 
@@ -48,24 +47,23 @@ No game files are included. You need your own copy of the game.
 
 ## Controls
 
-While the wallpaper runs, `molokolive` followed by a command controls it. The keys are the ones in the
-[i3 setup](#i3) below.
+While the wallpaper runs, `molokolive` followed by a command controls it. 
 
-| Command | What it does | Key |
-|---|---|---|
-| `molokolive next` | show the next scene | Alt+' |
-| `molokolive prev` | go back to the scene before | Alt+; |
-| `molokolive sky-next` | change the current scene's sky | Alt+Shift+' |
-| `molokolive sky-prev` | change it back | Alt+Shift+; |
-| `molokolive pause` / `resume` | pause or resume the animation | |
-| `molokolive status` | show the scene, its sky, and whether it's paused | |
+| Command | What it does |
+|---|---|
+| `molokolive next` | show the next scene |
+| `molokolive prev` | go back to the scene before |
+| `molokolive sky-next` | change the current scene's sky |
+| `molokolive sky-prev` | change it back |
+| `molokolive pause` / `resume` | pause or resume the animation |
+| `molokolive status` | show the scene, its sky, and whether it's paused |
 
-On its own, the wallpaper changes scene after every 60 seconds of animation, in random order, each time with a
+By default, the wallpaper changes scene after every 60 seconds of animation, in random order, each time with a
 random sky.
 
 ## Options
 
-The ones you're most likely to want. `molokolive --help` lists them all, and `--help-all` adds the advanced ones.
+`molokolive --help` lists them all, and `--help-all` adds the advanced ones.
 
 | Option | What it does |
 |---|---|
@@ -83,22 +81,6 @@ The ones you're most likely to want. `molokolive --help` lists them all, and `--
 `cg_fall_far`, `cg_firefly`, `cg_floor`, `cg_mirror`, `cg_mirror_brush`, `cg_pills`, `mini_cg_1`, `mini_cg_door`,
 `mini_cg_eyes`, `mini_cg_momp` and `mini_cg_run`.
 
-## i3
-
-Add this to your i3 config:
-
-```
-exec --no-startup-id molokolive --output window
-bindsym $mod+semicolon exec --no-startup-id molokolive prev
-bindsym $mod+apostrophe exec --no-startup-id molokolive next
-bindsym $mod+Shift+semicolon exec --no-startup-id molokolive sky-prev
-bindsym $mod+Shift+apostrophe exec --no-startup-id molokolive sky-next
-```
-
-- `exec` starts the wallpaper once per login, so reloading i3 doesn't restart the scene rotation.
-- `--output window` is needed because picom may not be running yet at the moment i3 starts the wallpaper.
-- Keep your usual wallpaper command (for example feh): its picture shows whenever molokolive isn't running.
-
 ## Palettes
 
 The default palette, `neutral-lift`, was fitted to scenes recoloured by hand. To make your own:
@@ -108,11 +90,9 @@ The default palette, `neutral-lift`, was fitted to scenes recoloured by hand. To
 3. Rebuild the scenes with it: `molokolive-pack --palette mine neutral-lift`
 4. Use it: `molokolive --palette mine`
 
-How the fit works is in [docs/palettes.md](docs/palettes.md).
-
 ## Tools
 
-Each tool explains itself with `--help`.
+Each tool supplies its own `--help`.
 
 | Tool | What it does |
 |---|---|
@@ -137,4 +117,10 @@ Nothing from the game is ever committed: extracted files stay in `rip/`, and the
 
 ---
 
-Made for one laptop, shared in case yours wants a milk-flavoured desktop too. If it does, that's thanks enough.
+## Attribution
+
+Special thanks to Nikita Kryukov for his work on the Milk series. Get the games here, they're worth every penny:
+ - [Milk inside a bag of milk inside a bag of milk](https://store.steampowered.com/app/1392820/)
+ - [Milk outside a bag of milk outside a bag of milk](https://store.steampowered.com/app/1604000/)
+
+**O! O! O!**
